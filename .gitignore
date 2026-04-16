@@ -10,3 +10,6 @@ __pycache__/
 .DS_Store
 .venv/
 .ipynb_checkpoints/
+
+# Utonia-specific
+utonia/
