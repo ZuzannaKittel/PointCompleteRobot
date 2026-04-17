@@ -9,7 +9,7 @@ class UtoniaBackbone(nn.Module):
         
         if not use_mock and on_cluster:
             try:
-                from models.utonia.model import PointTransformerV3 as RealUtonia
+                from utonia.model import PointTransformerV3 as RealUtonia
                 self.model = RealUtonia(
                     in_channels=3,
                     enc_channels=(36, 72, 144, 288, 576), 

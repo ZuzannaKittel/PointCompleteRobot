@@ -1,0 +1,23 @@
+# Core ML (IRIS Cluster optimized)
+torch
+torchvision
+torchaudio
+
+# 3D & Geometry
+open3d
+scipy
+numpy
+scikit-learn
+
+# Computer Vision
+opencv-python-headless
+matplotlib
+pillow
+
+# The Segmenter (SAM)
+git+https://github.com/facebookresearch/segment-anything.git
+
+# Features
+ftfy
+regex
+tqdm
