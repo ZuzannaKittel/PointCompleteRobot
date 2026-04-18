@@ -30,15 +30,48 @@ os.environ["SPCONV_ALGO_FILTER"] = "MaskImplicitGemm"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 from core.utonia_backbone import UtoniaBackbone
 
+# --- 0. INTRINSICS of DATASETS ---
+
+def get_intrinsics(path):
+    """Returns intrinsics based on the dataset detected in the path."""
+    if "Replica" in path:
+        return {"fx": 600.0, "fy": 600.0, "cx": 599.5, "cy": 339.5}
+    elif "ScanNetPP" in path:
+        # Standard ScanNet++ iPhone intrinsics (roughly)
+        # Note: Actual Scannet++ often provides these in a json file per frame!
+        return {"fx": 1050.0, "fy": 1050.0, "cx": 960.0, "cy": 720.0}
+    else:
+        print("⚠️ Unknown dataset, using Replica defaults.")
+        return {"fx": 600.0, "fy": 600.0, "cx": 599.5, "cy": 339.5}
+
 # --- 1. DATA & SAM TOOLS ---
 
-def load_replica_data(rgb_p, dep_p):
-    """Load and scale RGB-D from Replica."""
-    rgb = plt.imread(rgb_p)
-    depth = cv2.imread(dep_p, cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0
+def load_data(rgb_p, dep_p):
+    """Loads RGB and Depth, forcing them into the same pixel grid."""
+    # Use cv2 for both to ensure consistent coordinate handling
+    rgb = cv2.imread(rgb_p)
+    if rgb is None: raise FileNotFoundError(f"Could not load RGB at {rgb_p}")
+    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+    
+    depth_raw = cv2.imread(dep_p, cv2.IMREAD_UNCHANGED).astype(np.float32)
+    if depth_raw is None: raise FileNotFoundError(f"Could not load Depth at {dep_p}")
+    
+    # Scale depth (standard for ScanNet++ is /1000.0 for meters)
+    depth = depth_raw / 1000.0
+    
+    # --- THE CRITICAL FIX ---
+    rgb_h, rgb_w = rgb.shape[:2]
+    dep_h, dep_w = depth.shape[:2]
+    
+    if (rgb_h, rgb_w) != (dep_h, dep_w):
+        print(f"🔄 Resizing Depth ({dep_h}, {dep_w}) -> RGB ({rgb_h}, {rgb_w})")
+        # OpenCV resize expects (Width, Height)
+        depth = cv2.resize(depth, (rgb_w, rgb_h), interpolation=cv2.INTER_NEAREST)
+        
     return rgb, depth
+    
 
-def get_sam_mask(rgb, ckpt, point=(800, 500)):
+def get_sam_mask(rgb, ckpt, point=(500, 400)):
     """Segment object with SAM."""
     sam = sam_model_registry["vit_h"](checkpoint=ckpt).to(DEVICE)
     predictor = SamPredictor(sam)
@@ -87,12 +120,13 @@ def get_utonia_features(pc_tensor, ckpt_path):
 # --- 3. FUSION & VISUALIZATION ---
 
 def fuse_features(f1, f2):
-    """L2-Normalization and Concatenation."""
+    """This function performs L2-Normalization and Concatenation
+    to fuse Utonia and DINO features into a single multi-modal representation."""
     f1_n = f1 / (np.linalg.norm(f1, axis=1, keepdims=True) + 1e-8)
     f2_n = f2 / (np.linalg.norm(f2, axis=1, keepdims=True) + 1e-8)
     return np.hstack([f1_n, f2_n])
 
-def plot_multimodal_results(points, utonia, dino, fused, save_path="multimodal_fusion_pca.png"):
+def plot_multimodal_results(points, utonia, dino, fused, save_path="multimodal_fusion_pca_scannet.png"):
     print("🎨 Generating Triple PCA Plot (Standardized View)...")
     
     def to_rgb(feat):
@@ -112,7 +146,7 @@ def plot_multimodal_results(points, utonia, dino, fused, save_path="multimodal_f
         # Adjusting the scatter for clarity:
         ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=to_rgb(feat), s=5, alpha=0.8)
         
-        ax.set_title(titles[i], fontsize=20, pad=40, fontweight='bold')
+        ax.set_title(titles[i], fontsize=20, pad=40)
         
         # Fix the "Cutoff" headers by adding extra space
         ax.set_box_aspect([1,1,1]) # Equal aspect ratio
@@ -138,40 +172,80 @@ def plot_multimodal_results(points, utonia, dino, fused, save_path="multimodal_f
 # --- 4. MAIN ---
 
 if __name__ == "__main__":
-    # Paths
+    # --- TOGGLE DATASET PATHS HERE (Replica vs ScanNet) ---
+    # Paths for Replica (adjust if using ScanNet or other datasets)
+    """PATHS = {
+    "rgb": "data/Replica/room_0/imap/00/rgb/rgb_0.png",
+    "dep": "data/Replica/room_0/imap/00/depth/depth_0.png",
+    "sam": "checkpoints/weights/sam_vit_h_4b8939.pth",
+    "uto": "checkpoints/utoniadreamer/latest.pth"
+    }"""
+
+    # Paths for ScanNet (uncomment if testing on ScanNet)
     PATHS = {
-        "rgb": "data/Replica/room_0/imap/00/rgb/rgb_0.png",
-        "dep": "data/Replica/room_0/imap/00/depth/depth_0.png",
-        "sam": "checkpoints/weights/sam_vit_h_4b8939.pth",
-        "uto": "checkpoints/utoniadreamer/latest.pth"
+    "rgb": "data/ScanNetPP/30966f4c6e/iphone/rgb/frame_000000.jpg",
+    "dep": "data/ScanNetPP/30966f4c6e/iphone/depth/frame_000000.png",
+    "sam": "checkpoints/weights/sam_vit_h_4b8939.pth",
+    "uto": "checkpoints/utoniadreamer/latest.pth"
     }
 
-    # Pipeline Flow
-    rgb, depth = load_replica_data(PATHS["rgb"], PATHS["dep"])
+    # 2. Pipeline Flow
+    rgb, depth = load_data(PATHS["rgb"], PATHS["dep"])
+    
+    # 3. Get Intrinsics dynamically
+    K = get_intrinsics(PATHS["rgb"])
+    
+    # 4. SAM Masking
     mask = get_sam_mask(rgb, PATHS["sam"])
+    
+    # 5. DINO Features
     dino_map = get_dino_features(rgb)
     
-    # Lifting & Voxelization
+    # 6. Lifting & Voxelization
+    # Double check shapes here to prevent the IndexError
+    print(f"DEBUG: Depth shape {depth.shape}, Mask shape {mask.shape}")
+    
+    # Use the mask to extract valid pixels
+    z = depth[mask]
+    
     h, w = depth.shape
     v, u = np.indices((h, w))
-    z = depth[mask]
-    fx, fy, cx, cy = 600.0, 600.0, 599.5, 339.5
-    dense_xyz = np.stack([(u[mask]-cx)*z/fx, (v[mask]-cy)*z/fy, z], axis=1)
+    u_m, v_m = u[mask], v[mask]
+    
+    # Pinhole Projection
+    x = (u_m - K['cx']) * z / K['fx']
+    y = (v_m - K['cy']) * z / K['fy']
+    dense_xyz = np.stack([x, y, z], axis=1)
 
-    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(dense_xyz)).voxel_down_sample(0.01)
+    # 7. Geometry Cleanup
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(dense_xyz))
+    pcd = pcd.voxel_down_sample(voxel_size=0.01)
     pts = np.asarray(pcd.points).astype(np.float32)
+    
+    # Normalize for Utonia
     pts -= pts.mean(0)
-    pts /= (pts.max() + 1e-8)
+    pts /= (np.max(np.linalg.norm(pts, axis=1)) + 1e-8)
     
-    # Sync & Sample 8192
-    idx = np.random.choice(len(pts), 8192, replace=(len(pts) < 8192))
+    # 8. Sampling & Feature Sync
+    num_pts = 8192
+    if len(pts) >= num_pts:
+        idx = np.random.choice(len(pts), num_pts, replace=False)
+    else:
+        idx = np.random.choice(len(pts), num_pts, replace=True)
+    
     final_pts = pts[idx]
-    _, d_idx = KDTree(dense_xyz).query(final_pts)
     
-    # Inference & Fusion
-    u_feats = get_utonia_features(torch.from_numpy(final_pts).unsqueeze(0).to(DEVICE), PATHS["uto"])
-    d_feats = dino_map[mask][d_idx]
-    f_feats = fuse_features(u_feats, d_feats)
+    # Sync DINO features (using KDTree on the masked dense points)
+    # dense_dino contains features for every pixel where the mask was True
+    dense_dino = dino_map[mask] 
+    tree = KDTree(dense_xyz)
+    _, d_idx = tree.query(final_pts)
+    d_feats = dense_dino[d_idx]
 
-    # Result
+    # 9. Utonia Inference
+    u_input = torch.from_numpy(final_pts).unsqueeze(0).to(DEVICE)
+    u_feats = get_utonia_features(u_input, PATHS["uto"])
+    
+    # 10. Fusion & Plot
+    f_feats = fuse_features(u_feats, d_feats)
     plot_multimodal_results(final_pts, u_feats, d_feats, f_feats)
