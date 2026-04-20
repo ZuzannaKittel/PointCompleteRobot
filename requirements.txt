@@ -1,23 +1,15 @@
-# Core ML (IRIS Cluster optimized)
-torch
-torchvision
-torchaudio
+torch==2.5.1
+torchvision==0.20.1
 
-# 3D & Geometry
-open3d
-scipy
 numpy
-scikit-learn
-
-# Computer Vision
+scipy
 opencv-python-headless
+open3d
+
 matplotlib
-pillow
-
-# The Segmenter (SAM)
-git+https://github.com/facebookresearch/segment-anything.git
-
-# Features
-ftfy
-regex
 tqdm
+
+segment-anything
+huggingface_hub
+
+#what about all the utonia requirements? Do we need to specify them here or are they included in the utonia package?
