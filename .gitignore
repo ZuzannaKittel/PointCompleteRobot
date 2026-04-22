@@ -6,6 +6,8 @@ checkpoints/
 *.pcd
 *.npy
 *.png
+verify_frames/
+problem_example/
 
 # Python/OS
 __pycache__/
