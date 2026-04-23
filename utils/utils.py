@@ -16,6 +16,10 @@ def load_data(rgb_path, dep_path):
     depth = cv2.imread(dep_path, cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0
     return rgb, depth
 
+def load_metadata(json_path):
+    with open(json_path, "r") as f:
+        return json.load(f)
+
 def get_frame_info(meta, frame_key):
     entry = meta[frame_key]
     pose = np.array(entry["aligned_pose"], dtype=np.float32)
@@ -45,6 +49,24 @@ def get_dino_features_bilinear(model, rgb_image, mask):
     u_norm, v_norm = (2.0 * u / (mask.shape[1] - 1)) - 1.0, (2.0 * v / (mask.shape[0] - 1)) - 1.0
     grid = torch.stack([torch.tensor(u_norm), torch.tensor(v_norm)], dim=-1).view(1, 1, -1, 2).float().to(DEVICE)
     return F.grid_sample(feat, grid, mode='bilinear', align_corners=True).squeeze().T.cpu().numpy()
+
+def get_utonia_features(backbone, pc_tensor):
+    with torch.no_grad():
+        _, (sparse_coords, point_feats) = backbone(pc_tensor)
+    
+    s_coords = sparse_coords.detach().cpu().numpy()[:, -3:]
+    s_feats = point_feats.detach().cpu().numpy().squeeze()
+    
+    tree = KDTree(s_coords)
+    _, indices = tree.query(pc_tensor.squeeze().cpu().numpy())
+    return s_feats[indices]
+
+def fuse_features(f1, f2):
+    """This function performs L2-Normalization and Concatenation
+    to fuse Utonia and DINO features into a single multi-modal representation."""
+    f1_n = f1 / (np.linalg.norm(f1, axis=1, keepdims=True) + 1e-8)
+    f2_n = f2 / (np.linalg.norm(f2, axis=1, keepdims=True) + 1e-8)
+    return np.hstack([f1_n, f2_n])
 
 # --- GEOMETRY ---
 def lift_to_world(depth, mask, K, pose):
