@@ -8,6 +8,7 @@ checkpoints/
 *.png
 verify_frames/
 problem_example/
+visualizations/
 
 # Python/OS
 __pycache__/
@@ -23,3 +24,4 @@ utonia/
 
 # Test and debug files
 test_spconv.py
+obsolete/
