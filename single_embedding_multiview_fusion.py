@@ -80,7 +80,7 @@ def get_sam_mask(predictor, rgb, points):
     )
     return masks[np.argmax(scores)]
 
-# --- NEW: Bilinear Sub-pixel Sampling for DINO ---
+# --- Bilinear Sub-pixel Sampling for DINO ---
 def get_dino_features_bilinear(model, rgb_image, mask):
     """
     Replaces the blocky resize/indexing with smooth bilinear grid sampling.
@@ -125,7 +125,7 @@ def get_utonia_features(backbone, pc_tensor):
     _, indices = tree.query(pc_tensor.squeeze().cpu().numpy())
     return s_feats[indices]
 
-# --- NEW: Global Aggregator ---
+# --- Global Aggregator ---
 # [MODIFIED] Changed to accept fused features directly to ensure proper 1024 dimension
 def create_single_embedding(fused_feats):
     """
@@ -173,16 +173,35 @@ def voxel_fusion(points, features, voxel_size=0.015):
     print(f"  🔹 Reduced to {len(fused_pts)} voxels")
     return fused_pts, fused_feats
 
-# --- Main Pipeline Logic ---
+# --- NEW: 3D to 2D Projection ---
+def project_world_to_pixel(point_world, pose, K):
+    """
+    Takes a 3D point in the world and finds its [u, v] location in the current frame.
+    """
+    # 1. Transform world point to camera-relative coordinates
+    world_h = np.append(point_world, 1.0)
+    cam_h = np.linalg.inv(pose) @ world_h
+    pts_cam = cam_h[:3]
 
-def build_global_object(frame_indices, paths, sam_predictor, dino_model, prompt_points):
+    # 2. Project to 2D using intrinsics
+    u = (pts_cam[0] * K['fx'] / pts_cam[2]) + K['cx']
+    v = (pts_cam[1] * K['fy'] / pts_cam[2]) + K['cy']
+
+    return np.array([[u, v]])
+
+# --- Main Pipeline Logic ---
+# [MODIFIED] This function now also handles the dynamic prompt logic and saves verification images for each frame.
+def build_global_object(frame_indices, paths, sam_predictor, dino_model, initial_prompt):
     print("🌍 Phase 1: Multi-frame extraction and lifting...")
     meta = load_metadata(paths["json"])
 
     all_points = []
     all_dino = []
+    
+    # We will store the "Master 3D Point" once we calculate it in the first frame
+    target_world_point = None 
 
-    for idx in frame_indices:
+    for i, idx in enumerate(frame_indices):
         frame_key = f"frame_{idx:06d}"
         rgb_path = f"data/ScanNetPP/30966f4c6e/iphone/rgb/{frame_key}.jpg"
         dep_path = f"data/ScanNetPP/30966f4c6e/iphone/depth/{frame_key}.png"
@@ -193,12 +212,51 @@ def build_global_object(frame_indices, paths, sam_predictor, dino_model, prompt_
             print(f"  ❌ Skipping {frame_key}: {e}")
             continue
 
-        full_res_mask = get_sam_mask(sam_predictor, rgb, prompt_points)
+        pose, K = get_frame_info(meta, frame_key)
 
-        # --- NEW: VISUAL VERIFICATION ---
-        # This saves a "verification" image for every frame in the indices
+        # --- NEW: Dynamic Prompt Logic ---
+        if i == 0:
+            # 1. Get original RGB click coordinates
+            u_rgb, v_rgb = initial_prompt[0]
+            
+            # 2. Calculate scaling factors (RGB -> Depth)
+            scale_u = depth.shape[1] / rgb.shape[1]
+            scale_v = depth.shape[0] / rgb.shape[0]
+            
+            # 3. Map coordinates to depth resolution
+            u_depth = int(u_rgb * scale_u)
+            v_depth = int(v_rgb * scale_v)
+            
+            # 4. Safely get depth
+            z = depth[v_depth, u_depth] 
+            
+            # Lift to world using the SCALED Intrinsics (K_scaled is handled below, 
+            # but for the first frame's math, we use the depth-res version)
+            # We'll use your existing K_scaled logic but apply it here once
+            scale_x = depth.shape[1] / rgb.shape[1]
+            scale_y = depth.shape[0] / rgb.shape[0]
+            
+            fx_s, fy_s = K['fx'] * scale_x, K['fy'] * scale_y
+            cx_s, cy_s = K['cx'] * scale_x, K['cy'] * scale_y
+            
+            x = (u_depth - cx_s) * z / fx_s
+            y = (v_depth - cy_s) * z / fy_s
+            pts_cam = np.array([x, y, z, 1.0])
+            target_world_point = (pose @ pts_cam)[:3]
+            
+            current_prompt = initial_prompt
+            print(f"  📌 Anchored 3D point at depth px ({u_depth}, {v_depth}) -> World: {target_world_point}")
+        else:
+            # Later frames: CALCULATE where that 3D point is on the screen now
+            current_prompt = project_world_to_pixel(target_world_point, pose, K)
+            print(f"  🎯 Projected prompt to 2D: {current_prompt}")
+
+        # Run SAM with the dynamic prompt
+        full_res_mask = get_sam_mask(sam_predictor, rgb, current_prompt)
+
+        # Visual Verification
         verify_path = f"verify_frames/verify_{frame_key}.jpg"
-        save_verification_image(rgb, full_res_mask, prompt_points, verify_path)
+        save_verification_image(rgb, full_res_mask, current_prompt, verify_path)
         print(f"  📸 Saved target verification to: {verify_path}")
         
         mask_depth_res = cv2.resize(
@@ -206,8 +264,6 @@ def build_global_object(frame_indices, paths, sam_predictor, dino_model, prompt_
             (depth.shape[1], depth.shape[0]), 
             interpolation=cv2.INTER_NEAREST
         ).astype(bool)
-
-        pose, K = get_frame_info(meta, frame_key)
         
         K_scaled = K.copy()
         scale_x = depth.shape[1] / rgb.shape[1]
@@ -218,8 +274,6 @@ def build_global_object(frame_indices, paths, sam_predictor, dino_model, prompt_
         K_scaled['cy'] *= scale_y
 
         pts_world = lift_to_world(depth, mask_depth_res, K_scaled, pose)
-
-        # --- NEW: Swap to Bilinear DINO Sampling ---
         dino_feats = get_dino_features_bilinear(dino_model, rgb, mask_depth_res)
 
         print(f"Frame {idx}: DINO Mean={dino_feats.mean():.4f}, Max={dino_feats.max():.4f}")
@@ -315,7 +369,7 @@ def plot_multimodal_results(points, utonia, dino, fused, save_path="multimodal_f
     print(f"✨ SUCCESS: Standardized plot saved to {save_path}")
 
 
-# --- NEW: Single Embedding Visualization ---
+# --- Single Embedding Visualization ---
 # This function creates a "barcode" style visualization of the single global embedding vector.
 # It reshapes the 1D embedding into a 2D grid and applies a colormap to show the distribution of values.
 # This can help us visually inspect the global embedding and identify any patterns or salient features it captures.
@@ -351,7 +405,7 @@ def save_barcode(embedding, save_path="desk_identity_barcode.png"):
     print(f"📁 Global Embedding Barcode saved to: {save_path}")
 
 
-# NEW: This function creates a visualization of the RGB image with the SAM mask overlayed and the prompt point marked.
+# This function creates a visualization of the RGB image with the SAM mask overlayed and the prompt point marked.
 def save_verification_image(rgb, mask, prompt_points, save_path):
     """
     Saves an RGB image with the SAM mask overlayed and the prompt point marked.
@@ -408,16 +462,16 @@ if __name__ == "__main__":
         u_feats, 
         d_feats, 
         fused_pointwise, 
-        save_path="desk_16k_multimodal_pca_2.png"
+        save_path="desk_16k_multimodal_pca_3.png"
     )
 
     # 5. CREATE & PLOT GLOBAL EMBEDDING (The "Identity" part)
     # [ACTION] Condensing 16k points into 1 single vector
     global_embedding = create_single_embedding(fused_pointwise)
     
-    # --- NEW: Visualize the Single Global Embedding ---
+    # --- Visualize the Single Global Embedding ---
     print("\n--- Plotting Step 2: Global Identity Barcode ---")
-    save_barcode(global_embedding, "desk_global_identity_1408_2.png")
+    save_barcode(global_embedding, "desk_global_identity_1408_3.png")
     
     print("=========================================")
     print("✅ Pipeline Complete.")
