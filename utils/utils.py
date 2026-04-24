@@ -94,14 +94,106 @@ def voxel_fusion(points, features, voxel_size=0.015):
     return f_pts / counts[:, None], f_feats / counts[:, None]
 
 # --- PLOTTING ---
-def save_barcode(embedding, save_path):
-    emb_flat = embedding.flatten()
-    emb_norm = (emb_flat - emb_flat.mean()) / (emb_flat.std() + 1e-8)
-    grid = emb_norm.reshape(32, 44) if len(emb_flat) == 1408 else emb_norm[:32*32].reshape(32,32)
-    plt.imshow(grid, cmap='magma', aspect='auto')
-    plt.axis('off')
+# Basic 3D scatter with PCA-based coloring for better visualization of multi-modal features
+# This function standardizes the features before PCA to ensure that both Utonia and DINO contributions are visible in the color space.
+def plot_multimodal_results(points, utonia, dino, fused, save_path="multimodal_fusion_pca_scannet.png"):
+    print("🎨 Generating Triple PCA Plot (Standardized View)...")
+    def to_rgb(feat):
+        # 1. Standardize (Zero mean, Unit variance)
+        feat_norm = StandardScaler().fit_transform(feat)
+        # 2. PCA
+        pca_features = PCA(n_components=3).fit_transform(feat_norm)
+        # 3. CONTRAST BOOST: Instead of min/max, use tight percentiles
+        # This ignores the "floor" features if they are hogging the variance
+        p_low, p_high = np.percentile(pca_features, [5, 95], axis=0)
+        # Scale and Clip
+        rgb = (pca_features - p_low) / (p_high - p_low + 1e-8)
+        return np.clip(rgb, 0, 1)
+
+    fig = plt.figure(figsize=(24, 9))
+    titles = ["1. Geometry (Utonia)", "2. 2D Semantics (DINOv2)", "3. Features Fusion (multi-modal)"]
+    data = [utonia, dino, fused]
+
+    for i, feat in enumerate(data):
+        ax = fig.add_subplot(1, 3, i+1, projection='3d')
+        # Get the colors using robust function
+        colors = to_rgb(feat)
+        # Scatter plot
+        # --- IMPROVED SCATTER PARAMETERS ---
+        ax.scatter(
+            points[:, 0], 
+            points[:, 1], 
+            points[:, 2], 
+            c=colors, 
+            s=15,          # INCREASED: Helps fill gaps in sparse scans
+            alpha=0.9,     # OPAQUE: Makes the PCA colors pop
+            edgecolor='none', # REMOVE EDGES: Prevents the "black mesh" look
+            marker='o'     # SMOOTH: Circular points blend better than squares
+        )
+        # --- CLEANER BACKGROUND (MODERN AI LOOK) ---
+        # Remove the gray "panes" so the colorful points are the focus
+        ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        
+        # Make the grid lines very subtle
+        ax.grid(True, linestyle='--', alpha=0.2)
+
+        ax.set_title(titles[i], fontsize=20, pad=40)
+        
+        # Revert to your original 'Auto-Fit' style
+        ax.set_box_aspect(None)
+
+        # Labels
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_zlabel('Z (m)')
+        # View angle
+        ax.view_init(elev=20, azim=-45)
+        # Tighten limits
+        ax.set_xlim(points[:,0].min(), points[:,0].max())
+        ax.set_ylim(points[:,1].min(), points[:,1].max())
+        ax.set_zlim(points[:,2].min(), points[:,2].max())
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close() # Good practice to close figure to save memory
+    print(f"✨ SUCCESS: Standardized plot saved to {save_path}")
+
+# --- Single Embedding Visualization ---
+# This function creates a "barcode" style visualization of the single global embedding vector.
+# It reshapes the 1D embedding into a 2D grid and applies a colormap to show the distribution of values.
+# This can help us visually inspect the global embedding and identify any patterns or salient features it captures.
+# Updated to handle non-square dimensions like 1408
+def save_barcode(embedding, save_path="desk_identity_barcode.png"):
+    """
+    Visualizes the 1408-d global embedding as a rectangular fingerprint.
+    """
+    emb_flat = embedding.flatten()
+    print(f"📊 Creating barcode for {len(emb_flat)} features...")
+
+    # Normalize for visual contrast
+    emb_norm = (emb_flat - emb_flat.mean()) / (emb_flat.std() + 1e-8)
+    
+    # 1408 features factor perfectly into 32 x 44
+    # This ensures no data is truncated.
+    try:
+        grid = emb_norm.reshape(32, 44)
+    except ValueError:
+        # Fallback if dimensions change again
+        side = int(np.sqrt(len(emb_norm)))
+        grid = emb_norm[:side*side].reshape(side, side)
+
+    plt.figure(figsize=(12, 8))
+    plt.imshow(grid, cmap='magma', aspect='auto', interpolation='nearest')
+    plt.title(f"Global Object Fingerprint (Dim: {len(emb_flat)})", fontsize=16)
+    plt.colorbar(label="Activation Strength")
+    plt.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
     plt.close()
+    print(f"📁 Global Embedding Barcode saved to: {save_path}")
 
 def save_verification_image(rgb, mask, prompt_points, save_path):
     vis_img = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
