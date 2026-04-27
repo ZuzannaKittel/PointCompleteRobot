@@ -9,6 +9,7 @@ from utils.utils import (load_data, load_metadata,get_frame_info, get_sam_mask, 
                    save_verification_image, get_utonia_features, fuse_features, plot_multimodal_results)
 
 from utils.gt_extractor import extract_gt_object
+from utils.objectX_functions import SLatCompressor, create_structured_latent
 
 PATHS = {
     "sam": "checkpoints/weights/sam_vit_h_4b8939.pth",
@@ -119,15 +120,32 @@ def run_utonia_on_fused(backbone, points, num_pts=16384):
     pts = points.copy()
     pts -= pts.mean(0)
     pts /= (np.max(np.linalg.norm(pts, axis=1)) + 1e-8)
+
+    # --- DEBUG CHECK ---
+    print(f"DEBUG: Pre-clamp Range -> Min: {pts.min():.2f}, Max: {pts.max():.2f}")
+    # If these values are between -1.0 and 1.0, you are safe from the clamp!
+    # -------------------
     
     idx = np.random.choice(len(pts), num_pts, replace=(len(pts) < num_pts)).astype(np.int64)
     pts_s = pts[idx]
     
     u_input = torch.from_numpy(pts_s).float().unsqueeze(0).cuda()
-    u_feats = get_utonia_features(backbone, u_input)
+
+    # NEW: Ensure this returns (1, 16384, 1024) and NOT (1, 1024)
+    # for pointwise features, we need to modify the get_utonia_features function to return per-point features instead of global max-pooled features
+    u_feats_pointwise = get_utonia_features(backbone, u_input, return_pointwise=True)
+
+    # For debugging, let's print the shape of the pointwise features
+    print(f"DEBUG: Utonia Pointwise Features Shape: {u_feats_pointwise.shape}")  # Should be (1, 16384, 1024)
     
+    # u_feats = get_utonia_features(backbone, u_input) # This is the original line that returns global features, but we need pointwise for fusion
+    
+    # Squeeze the batch dimension if necessary to get (16384, 1024)
+    if u_feats_pointwise.dim() == 3:
+        u_feats_pointwise = u_feats_pointwise.squeeze(0)
+
     # Return idx so the main block can use it to slice f_dino and f_pts
-    return pts_s, u_feats, idx
+    return pts_s, u_feats_pointwise.cpu().numpy(), idx
 
 if __name__ == "__main__":
     # 0. Ensure GT Output Directory Exists
@@ -148,14 +166,16 @@ if __name__ == "__main__":
     gt_points, gt_meta = extract_gt_object(PATHS["mesh"], anchor, gt_save_path)
     # --------------------------------------
 
-    # 3. Create Embedding
+    # 3. Create Pointwise Embedding
+    # s_pts: (16384, 3), u_feats: (16384, 1024)
     s_pts, u_feats, sampled_indices = run_utonia_on_fused(uto, f_pts)
 
-    # Align DINO and real-world points with the Utonia samples
+    # d_feats: (16384, 384)
     d_feats = f_dino[sampled_indices]
     real_world_pts = f_pts[sampled_indices]
 
-    # 4. FUSE & PLOT 16K PCA (The "Visual" part)
+    # 4. FUSE POINTWISE: (16384, 1408)
+    # This is the "rich" data Object-X needs!
     fused_pointwise = fuse_features(u_feats, d_feats)
 
     print("\n--- Plotting Step 1: 16k Point Cloud Analysis ---")
@@ -168,15 +188,38 @@ if __name__ == "__main__":
     )
     
     # 5. CREATE & PLOT GLOBAL EMBEDDING (The "Identity" part)
-    print("📦 Creating Global Object Fingerprint...")
+    print("📦 Creating Global Object Embedding...")
     global_embedding = torch.max(torch.from_numpy(fused_pointwise).cuda(), dim=0, keepdim=True)[0].cpu().numpy()
     save_barcode(global_embedding, "desk_final_identity_4.png")
     
     print(f"\n🚀 SUCCESS: Identity barcode (shape: {global_embedding.shape}) created and GT Desk saved at {gt_save_path}")
+
+    # ==========================================
+    # --- NEW: Phase 6 - Object-X SLat Approach ---
+    # ==========================================
+    print("\n🧊 Phase 6: Generating Object-X Structured Latent...")
+    
+    # A. Voxelize the points and features into 16x16x16
+    slat_volume = create_structured_latent(real_world_pts, fused_pointwise, grid_res=64) # 64^3 grid
+    print(f"  🔹 Raw Volume Shape: {slat_volume.shape}") # Should be [1, 1408, 16, 16, 16]
+    
+    # B. Compress to 8 dimensions (Initialize model once, ideally outside the loop if doing many objects)
+    compressor = SLatCompressor(in_channels=1408, out_channels=8).cuda()
+    
+    # Pass the volume through the 3D CNN
+    with torch.no_grad(): # No grad needed for just extracting the embedding
+        final_slat = compressor(slat_volume)
+        
+    print(f"  🚀 Final Object-X SLat Shape: {final_slat.shape}") # Should be [1, 8, 16, 16, 16]
+    
+    # You can save this tensor for your completion decoder later
+    torch.save(final_slat.cpu(), "data/gt_output/desk_slat_embedding_4.pt")
+    # ==========================================
 
     print("\n" + "="*40)
     print("✅ Pipeline Complete.")
     print(f"🔹 Input (Partial): {len(real_world_pts)} points")
     print(f"🔹 Target (GT):     {len(gt_points)} points")
     print(f"🔹 Embedding Shape: {global_embedding.shape}")
+    print(f"🔹 SLat Shape:     {final_slat.shape}")
     print("="*40)

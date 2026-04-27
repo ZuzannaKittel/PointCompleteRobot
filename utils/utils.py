@@ -50,16 +50,38 @@ def get_dino_features_bilinear(model, rgb_image, mask):
     grid = torch.stack([torch.tensor(u_norm), torch.tensor(v_norm)], dim=-1).view(1, 1, -1, 2).float().to(DEVICE)
     return F.grid_sample(feat, grid, mode='bilinear', align_corners=True).squeeze().T.cpu().numpy()
 
-def get_utonia_features(backbone, pc_tensor):
+def get_utonia_features(backbone, pc_tensor, return_pointwise=False):
+    """
+    Extracts geometric features from the Utonia backbone.
+    NEW: If return_pointwise=True, it returns the (1, N, 1024) features.
+    """
     with torch.no_grad():
-        _, (sparse_coords, point_feats) = backbone(pc_tensor)
+        global_feat, (sparse_coords, point_feats) = backbone(pc_tensor)
     
-    s_coords = sparse_coords.detach().cpu().numpy()[:, -3:]
-    s_feats = point_feats.detach().cpu().numpy().squeeze()
-    
-    tree = KDTree(s_coords)
-    _, indices = tree.query(pc_tensor.squeeze().cpu().numpy())
-    return s_feats[indices]
+    if return_pointwise:
+        # We need to map the output features back to the EXACT input point order.
+        # Since PointTransformer might subsample or shuffle via voxelization internally, 
+        # we use KDTree to map the output features back to the original pc_tensor order.
+        
+        # Ensure we are working with CPU numpy arrays for the KDTree
+        s_coords = sparse_coords.detach().cpu().numpy()[:, -3:]
+        s_feats = point_feats.detach().cpu().numpy()
+        
+        # Original input points
+        orig_pts = pc_tensor.squeeze(0).cpu().numpy()
+        
+        # Map Utonia's output points to our input points
+        tree = KDTree(s_coords)
+        _, indices = tree.query(orig_pts)
+        
+        # Get the pointwise features in the correct order
+        aligned_point_feats = s_feats[indices]
+        
+        # Return as a tensor with batch dimension (1, N, 1024) to match expectations
+        return torch.from_numpy(aligned_point_feats).unsqueeze(0).to(pc_tensor.device)
+        
+    # If not pointwise, return the global feature
+    return global_feat
 
 def fuse_features(f1, f2):
     """This function performs L2-Normalization and Concatenation

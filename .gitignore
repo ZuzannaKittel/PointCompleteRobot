@@ -6,6 +6,7 @@ checkpoints/
 *.pcd
 *.npy
 *.png
+*.pt
 verify_frames/
 problem_example/
 visualizations/
