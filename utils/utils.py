@@ -53,7 +53,7 @@ def get_dino_features_bilinear(model, rgb_image, mask):
 def get_utonia_features(backbone, pc_tensor, return_pointwise=False):
     """
     Extracts geometric features from the Utonia backbone.
-    NEW: If return_pointwise=True, it returns the (1, N, 1024) features.
+    If return_pointwise=True, it returns the (1, N, 1024) features.
     """
     with torch.no_grad():
         global_feat, (sparse_coords, point_feats) = backbone(pc_tensor)

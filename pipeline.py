@@ -9,7 +9,7 @@ from utils.utils import (load_data, load_metadata,get_frame_info, get_sam_mask, 
                    save_verification_image, get_utonia_features, fuse_features, plot_multimodal_results)
 
 from utils.gt_extractor import extract_gt_object
-from utils.objectX_functions import SLatCompressor, create_structured_latent
+from models.objectX import SLatCompressor, create_structured_latent, U3DGS_SpatialCompressor
 
 PATHS = {
     "sam": "checkpoints/weights/sam_vit_h_4b8939.pth",
@@ -131,7 +131,7 @@ def run_utonia_on_fused(backbone, points, num_pts=16384):
     
     u_input = torch.from_numpy(pts_s).float().unsqueeze(0).cuda()
 
-    # NEW: Ensure this returns (1, 16384, 1024) and NOT (1, 1024)
+    # Ensure this returns (1, 16384, 1024) and NOT (1, 1024)
     # for pointwise features, we need to modify the get_utonia_features function to return per-point features instead of global max-pooled features
     u_feats_pointwise = get_utonia_features(backbone, u_input, return_pointwise=True)
 
@@ -157,7 +157,8 @@ if __name__ == "__main__":
     uto = init_utonia(PATHS["uto"])
 
     # 2. Extract Partial Scan & 3D Anchor
-    raw_pts, raw_dino, anchor = build_global_object([0, 10, 20, 30, 40], PATHS, sam, dino, [[470, 370]])
+    # raw_pts, raw_dino, anchor = build_global_object([0, 10, 20, 30, 40], PATHS, sam, dino, [[470, 370]])
+    raw_pts, raw_dino, anchor = build_global_object([0, 10, 20, 30, 40], PATHS, sam, dino, [[1000, 700]])
     f_pts, f_dino = voxel_fusion(raw_pts, raw_dino)
 
     # --- Phase 2.5 - GT Extraction ---
@@ -184,42 +185,57 @@ if __name__ == "__main__":
         u_feats, 
         d_feats, 
         fused_pointwise, 
-        save_path="desk_16k_multimodal_pca_4.png"
+        save_path="desk_16k_multimodal_pca_5.png"
     )
     
     # 5. CREATE & PLOT GLOBAL EMBEDDING (The "Identity" part)
     print("📦 Creating Global Object Embedding...")
     global_embedding = torch.max(torch.from_numpy(fused_pointwise).cuda(), dim=0, keepdim=True)[0].cpu().numpy()
-    save_barcode(global_embedding, "desk_final_identity_4.png")
+    save_barcode(global_embedding, "desk_final_identity_5.png")
     
     print(f"\n🚀 SUCCESS: Identity barcode (shape: {global_embedding.shape}) created and GT Desk saved at {gt_save_path}")
 
+    # --- Updated Phase 6: The Full Object-X Funnel ---
+    print("\n🧊 Phase 6: Generating Object-X Structured Latent & U-3DGS Embedding...")
+
     # ==========================================
-    # --- NEW: Phase 6 - Object-X SLat Approach ---
+    # --- Phase 6 - Object-X Funnel ---
     # ==========================================
-    print("\n🧊 Phase 6: Generating Object-X Structured Latent...")
-    
-    # A. Voxelize the points and features into 16x16x16
-    slat_volume = create_structured_latent(real_world_pts, fused_pointwise, grid_res=64) # 64^3 grid
-    print(f"  🔹 Raw Volume Shape: {slat_volume.shape}") # Should be [1, 1408, 16, 16, 16]
-    
-    # B. Compress to 8 dimensions (Initialize model once, ideally outside the loop if doing many objects)
-    compressor = SLatCompressor(in_channels=1408, out_channels=8).cuda()
-    
-    # Pass the volume through the 3D CNN
-    with torch.no_grad(): # No grad needed for just extracting the embedding
-        final_slat = compressor(slat_volume)
+    print("\n🧊 Phase 6: Generating Object-X Hierarchical Embeddings...")
+
+    # A. Voxelize + Get Mask
+    raw_vol, mask_64 = create_structured_latent(real_world_pts, fused_pointwise, grid_res=64)
+
+    # B. Generate 64^3 SLat
+    compressor_64 = SLatCompressor(in_channels=1408, out_channels=8).cuda()
+    with torch.no_grad():
+        slat_64 = compressor_64(raw_vol)
         
-    print(f"  🚀 Final Object-X SLat Shape: {final_slat.shape}") # Should be [1, 8, 16, 16, 16]
-    
-    # You can save this tensor for your completion decoder later
-    torch.save(final_slat.cpu(), "data/gt_output/desk_slat_embedding_4.pt")
-    # ==========================================
+        # CRITICAL: Apply Mask to kill hallucinations
+        # This turns your "solid block" back into a "desk shape"
+        slat_64 = slat_64 * mask_64 
+
+    # C. Generate 16^3 U-3DGS Embedding (The spatial compression)
+    spatial_compressor = U3DGS_SpatialCompressor().cuda()
+    with torch.no_grad():
+        u3dgs_16 = spatial_compressor(slat_64)
+
+    # --- DEBUG STATS ---
+    active_64 = (slat_64.abs().sum(1) > 1e-5).sum().item()
+    active_16 = (u3dgs_16.abs().sum(1) > 1e-5).sum().item()
+    print(f"📊 Sparsity Check:")
+    print(f"   - SLat 64^3 Active: {active_64} / {64**3} ({active_64/64**3:.2%})")
+    print(f"   - U-3DGS 16^3 Active: {active_16} / {16**3} ({active_16/16**3:.2%})")
+
+    # Save both
+    torch.save(slat_64.cpu(), "desk_slat_64.pt")
+    torch.save(u3dgs_16.cpu(), "desk_u3dgs_16.pt")
 
     print("\n" + "="*40)
     print("✅ Pipeline Complete.")
     print(f"🔹 Input (Partial): {len(real_world_pts)} points")
     print(f"🔹 Target (GT):     {len(gt_points)} points")
     print(f"🔹 Embedding Shape: {global_embedding.shape}")
-    print(f"🔹 SLat Shape:     {final_slat.shape}")
+    print(f"🔹 SLat Shape:     {slat_64.shape}")
+    print(f"🔹 U-3DGS Shape:   {u3dgs_16.shape}") 
     print("="*40)

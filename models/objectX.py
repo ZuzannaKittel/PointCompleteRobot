@@ -4,31 +4,29 @@ import torch.nn as nn
 # --- 1. The Compression Network (3D U-Net with 2 downsampling layers) ---
 class SLatCompressor(nn.Module):
     def __init__(self, in_channels=1408, out_channels=8):
-        """
-        3D U-Net that compresses multi-modal features into lightweight latent space
-        while preserving fine geometric details through multi-scale encoding.
-        Architecture: 2 downsampling layers + bottleneck + 2 upsampling layers with skip connections.
-        """
         super().__init__()
+        
+        # Use a negative slope of 0.2, which is standard for 3D sparse architectures
+        leak = 0.2 
         
         # Encoder (downsampling path)
         self.enc1 = nn.Sequential(
             nn.Conv3d(in_channels, 256, kernel_size=3, padding=1),
             nn.BatchNorm3d(256),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(leak, inplace=True), # CHANGED
             nn.Conv3d(256, 256, kernel_size=3, padding=1),
             nn.BatchNorm3d(256),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(leak, inplace=True), # CHANGED
         )
         self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)
         
         self.enc2 = nn.Sequential(
             nn.Conv3d(256, 128, kernel_size=3, padding=1),
             nn.BatchNorm3d(128),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(leak, inplace=True), # CHANGED
             nn.Conv3d(128, 128, kernel_size=3, padding=1),
             nn.BatchNorm3d(128),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(leak, inplace=True), # CHANGED
         )
         self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)
         
@@ -36,34 +34,35 @@ class SLatCompressor(nn.Module):
         self.bottleneck = nn.Sequential(
             nn.Conv3d(128, 64, kernel_size=3, padding=1),
             nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(leak, inplace=True), # CHANGED
             nn.Conv3d(64, 64, kernel_size=3, padding=1),
             nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(leak, inplace=True), # CHANGED
         )
         
         # Decoder (upsampling path)
         self.upsampler1 = nn.Upsample(scale_factor=2, mode='nearest')
         self.dec1 = nn.Sequential(
-            nn.Conv3d(128 + 64, 128, kernel_size=3, padding=1),  # Skip connection from enc2
+            nn.Conv3d(128 + 64, 128, kernel_size=3, padding=1),
             nn.BatchNorm3d(128),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(leak, inplace=True), # CHANGED
             nn.Conv3d(128, 128, kernel_size=3, padding=1),
             nn.BatchNorm3d(128),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(leak, inplace=True), # CHANGED
         )
         
         self.upsampler2 = nn.Upsample(scale_factor=2, mode='nearest')
         self.dec2 = nn.Sequential(
-            nn.Conv3d(256 + 128, 256, kernel_size=3, padding=1),  # Skip connection from enc1
+            nn.Conv3d(256 + 128, 256, kernel_size=3, padding=1),
             nn.BatchNorm3d(256),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(leak, inplace=True), # CHANGED
             nn.Conv3d(256, 256, kernel_size=3, padding=1),
             nn.BatchNorm3d(256),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(leak, inplace=True), # CHANGED
         )
         
-        # Final layer: compress to output channels
+        # Final layer: NO LEAKY RELU HERE. 
+        # Keep it linear so we can apply the occupancy mask effectively.
         self.final = nn.Conv3d(256, out_channels, kernel_size=1)
 
     def forward(self, x):
@@ -91,41 +90,52 @@ class SLatCompressor(nn.Module):
         # Final compression to target dimension
         out = self.final(d2)
         return out
+    
+
+class U3DGS_SpatialCompressor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            # 64 -> 32
+            nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm3d(16),
+            nn.LeakyReLU(0.2),
+            # 32 -> 16
+            nn.Conv3d(16, 8, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm3d(8)
+        )
+    def forward(self, x):
+        return self.encoder(x)
 
 
 # --- 2. The Voxelization Function ---
 def create_structured_latent(points, features, grid_res=64):
     """
-    Converts a point cloud with features into a 3D Voxel Grid (Structured Latent).
+    Returns:
+        voxel_volume: (1, 1408, 64, 64, 64)
+        occupancy_mask: (1, 1, 64, 64, 64) - Binary mask (1 where points exist, 0 else)
     """
-    print(f"🧊 Building {grid_res}^3 Structured Latent (Object-X style)...")
+    print(f"🧊 Building {grid_res}^3 Structured Latent...")
     
     pts_t = torch.from_numpy(points).float().cuda()
     feats_t = torch.from_numpy(features).float().cuda()
     
-    # 1. Normalize points to strictly [0, 1] bounding box
-    pts_min = pts_t.min(dim=0)[0]
-    pts_max = pts_t.max(dim=0)[0]
+    # Normalize and scale
+    pts_min, pts_max = pts_t.min(0)[0], pts_t.max(0)[0]
     pts_norm = (pts_t - pts_min) / (pts_max - pts_min + 1e-8)
+    grid_coords = torch.clamp((pts_norm * (grid_res - 1)).long(), 0, grid_res - 1)
     
-    # 2. Scale to grid indices [0, 15]
-    grid_coords = torch.clamp((pts_norm * grid_res).long(), 0, grid_res - 1)
-    
-    # 3. Flatten 3D coordinates into a 1D index array for scattering
-    # index = x * (res^2) + y * res + z
     indices = grid_coords[:, 0] * (grid_res**2) + grid_coords[:, 1] * grid_res + grid_coords[:, 2]
     
-    # 4. Initialize empty flat grid: Shape (Channels, Total_Voxels)
-    C = feats_t.shape[1]
-    V = grid_res**3
+    # Create the Feature Grid
+    C, V = feats_t.shape[1], grid_res**3
     flat_grid = torch.zeros((C, V), device=feats_t.device)
-    
-    # 5. Scatter Max Pooling
-    # We transpose features to (C, N) to scatter them into the (C, V) grid based on indices
-    # We use index_reduce_ (the beta function from your logs!) to take the max feature per voxel
     flat_grid.index_reduce_(1, indices, feats_t.T, reduce='amax', include_self=False)
-    
-    # 6. Reshape back into 3D volume: (Batch, Channels, D, H, W)
     voxel_volume = flat_grid.view(1, C, grid_res, grid_res, grid_res)
     
-    return voxel_volume
+    # --- NEW: Create the Occupancy Mask ---
+    mask_flat = torch.zeros(V, device=feats_t.device)
+    mask_flat.scatter_(0, indices, 1.0) # Mark occupied voxels as 1
+    occupancy_mask = mask_flat.view(1, 1, grid_res, grid_res, grid_res)
+    
+    return voxel_volume, occupancy_mask
