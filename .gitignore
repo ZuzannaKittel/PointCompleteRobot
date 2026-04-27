@@ -11,6 +11,7 @@ checkpoints/
 verify_frames/
 problem_example/
 visualizations/
+temp/
 
 # Python/OS
 __pycache__/
