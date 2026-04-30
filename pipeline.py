@@ -8,14 +8,16 @@ from utils.utils import (load_data, load_metadata,get_frame_info, get_sam_mask, 
                    lift_to_world, project_world_to_pixel, voxel_fusion, save_barcode, 
                    save_verification_image, get_utonia_features, fuse_features, plot_multimodal_results)
 
-from utils.gt_extractor import extract_gt_object
+from utils.gt_extractor_scannotatepp import extract_scannotate_gt
 from models.objectX import SLatCompressor, create_structured_latent, U3DGS_SpatialCompressor
+
+import trimesh
 
 PATHS = {
     "sam": "checkpoints/weights/sam_vit_h_4b8939.pth",
     "uto": "checkpoints/utoniadreamer/latest.pth",
-    "json": "data/ScanNetPP/30966f4c6e/iphone/pose_intrinsic_imu.json",
-    "mesh": "data/ScanNetPP/30966f4c6e/scans/mesh_aligned_0.05_semantic.ply"
+    "json": "data/ScanNetpp/data/30966f4c6e/iphone/pose_intrinsic_imu.json",
+    "mesh": "data/ScanNetpp/data/30966f4c6e/scans/mesh_aligned_0.05_semantic.ply"
 }
 os.makedirs("verify_frames", exist_ok=True)
 
@@ -31,8 +33,8 @@ def build_global_object(frame_indices, paths, sam_predictor, dino_model, initial
 
     for i, idx in enumerate(frame_indices):
         frame_key = f"frame_{idx:06d}"
-        rgb_path = f"data/ScanNetPP/30966f4c6e/iphone/rgb/{frame_key}.jpg"
-        dep_path = f"data/ScanNetPP/30966f4c6e/iphone/depth/{frame_key}.png"
+        rgb_path = f"data/ScanNetpp/data/30966f4c6e/iphone/rgb/{frame_key}.jpg"
+        dep_path = f"data/ScanNetpp/data/30966f4c6e/iphone/depth/{frame_key}.png"
 
         try:
             rgb, depth = load_data(rgb_path, dep_path)
@@ -151,6 +153,10 @@ if __name__ == "__main__":
     # 0. Ensure GT Output Directory Exists
     os.makedirs("data/gt_output", exist_ok=True)
 
+    # 0. Define paths for Scannotate
+    PKL_PATH = "data/ScanNetpp/annotations/30966f4c6e/30966f4c6e.pkl"
+    SHAPENET_ROOT = "data/ShapeNet/ShapeNet_preprocessed"
+
     # 1. Init
     sam = init_sam(PATHS["sam"])
     dino = init_dino()
@@ -161,11 +167,16 @@ if __name__ == "__main__":
     raw_pts, raw_dino, anchor = build_global_object([0, 10, 20, 30, 40], PATHS, sam, dino, [[1000, 700]])
     f_pts, f_dino = voxel_fusion(raw_pts, raw_dino)
 
-    # --- Phase 2.5 - GT Extraction ---
-    print("\n⚖️ Phase 2.5: Harvesting Ground Truth Laser Scan...")
-    gt_save_path = "data/gt_output/gt_desk_30966.ply"
-    gt_points, gt_meta = extract_gt_object(PATHS["mesh"], anchor, gt_save_path)
-    # --------------------------------------
+    # --- NEW PHASE 2.5: SCANnotate GT Extraction ---
+    print("\n💎 Phase 2.5: Harvesting High-Fidelity CAD Ground Truth...")
+    gt_points, gt_metadata = extract_scannotate_gt(PKL_PATH, SHAPENET_ROOT, anchor)
+    gt_save_path = "data/gt_output/perfect_cad_target.ply"
+    
+    if gt_points is not None:
+        # Save for MeshLab verification
+        gt_mesh = trimesh.PointCloud(gt_points)
+        gt_mesh.export("data/gt_output/perfect_cad_target.ply")
+    # -----------------------------------------------
 
     # 3. Create Pointwise Embedding
     # s_pts: (16384, 3), u_feats: (16384, 1024)
@@ -185,23 +196,21 @@ if __name__ == "__main__":
         u_feats, 
         d_feats, 
         fused_pointwise, 
-        save_path="desk_16k_multimodal_pca_5.png"
+        save_path="desk_16k_multimodal_pca_6.png"
     )
     
     # 5. CREATE & PLOT GLOBAL EMBEDDING (The "Identity" part)
     print("📦 Creating Global Object Embedding...")
     global_embedding = torch.max(torch.from_numpy(fused_pointwise).cuda(), dim=0, keepdim=True)[0].cpu().numpy()
-    save_barcode(global_embedding, "desk_final_identity_5.png")
+    save_barcode(global_embedding, "desk_final_identity_6.png")
     
-    print(f"\n🚀 SUCCESS: Identity barcode (shape: {global_embedding.shape}) created and GT Desk saved at {gt_save_path}")
+    if gt_points is not None:
+        print(f"\n🚀 SUCCESS: Identity barcode (shape: {global_embedding.shape}) created and GT Desk saved at {gt_save_path}")
+    else:
+        print("\n⚠️ GT Desk not available, but pipeline ran successfully up to embedding creation.")
 
-    # --- Updated Phase 6: The Full Object-X Funnel ---
+    # --- 6: The Full Object-X Funnel ---
     print("\n🧊 Phase 6: Generating Object-X Structured Latent & U-3DGS Embedding...")
-
-    # ==========================================
-    # --- Phase 6 - Object-X Funnel ---
-    # ==========================================
-    print("\n🧊 Phase 6: Generating Object-X Hierarchical Embeddings...")
 
     # A. Voxelize + Get Mask
     raw_vol, mask_64 = create_structured_latent(real_world_pts, fused_pointwise, grid_res=64)
@@ -228,13 +237,15 @@ if __name__ == "__main__":
     print(f"   - U-3DGS 16^3 Active: {active_16} / {16**3} ({active_16/16**3:.2%})")
 
     # Save both
-    torch.save(slat_64.cpu(), "desk_slat_64.pt")
-    torch.save(u3dgs_16.cpu(), "desk_u3dgs_16.pt")
+    torch.save(slat_64.cpu(), "desk_slat_64_6.pt")
+    torch.save(u3dgs_16.cpu(), "desk_u3dgs_16_6.pt")
 
     print("\n" + "="*40)
     print("✅ Pipeline Complete.")
     print(f"🔹 Input (Partial): {len(real_world_pts)} points")
-    print(f"🔹 Target (GT):     {len(gt_points)} points")
+    # SAFE PRINT: Using a ternary operator to handle the NoneType
+    gt_count = len(gt_points) if gt_points is not None else 0
+    print(f"🔹 Target (GT):     {gt_count} points")
     print(f"🔹 Embedding Shape: {global_embedding.shape}")
     print(f"🔹 SLat Shape:     {slat_64.shape}")
     print(f"🔹 U-3DGS Shape:   {u3dgs_16.shape}") 

@@ -133,7 +133,7 @@ def create_structured_latent(points, features, grid_res=64):
     flat_grid.index_reduce_(1, indices, feats_t.T, reduce='amax', include_self=False)
     voxel_volume = flat_grid.view(1, C, grid_res, grid_res, grid_res)
     
-    # --- NEW: Create the Occupancy Mask ---
+    # --- Create the Occupancy Mask ---
     mask_flat = torch.zeros(V, device=feats_t.device)
     mask_flat.scatter_(0, indices, 1.0) # Mark occupied voxels as 1
     occupancy_mask = mask_flat.view(1, 1, grid_res, grid_res, grid_res)

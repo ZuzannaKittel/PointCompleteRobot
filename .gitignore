@@ -29,3 +29,6 @@ utonia/
 test_spconv.py
 objectX_test.py
 obsolete/
+
+# Ignore the SCANnotatepp files and scripts
+SCANnotatepp/
