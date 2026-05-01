@@ -8,6 +8,7 @@ checkpoints/
 *.png
 *.pt
 *.ply
+*.jpg
 verify_frames/
 problem_example/
 visualizations/
