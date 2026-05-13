@@ -8,6 +8,10 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
+# Fix for trimesh compatibility with Numpy 2.0
+if not hasattr(np, 'product'):
+    np.product = np.prod
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- I/O & METADATA ---
@@ -47,7 +51,15 @@ def get_sam_mask(predictor, rgb, box=None, points=None):
         
     return masks[np.argmax(scores)]
 
-def get_dino_features_bilinear(model, rgb_image, mask):
+def get_dino_features_bilinear(model, rgb_image, uv_coords):
+    """
+    Bilinearly samples DINOv2 patch features at continuous sub-pixel coordinates.
+    
+    Args:
+        model: Trained DINOv2 model.
+        rgb_image (np.ndarray): High-res source image [H, W, 3].
+        uv_coords (np.ndarray): Continuous float pixel positions [N, 2].
+    """
     h, w = rgb_image.shape[:2]
     img_t = torch.from_numpy(rgb_image).permute(2,0,1).unsqueeze(0).float().to(DEVICE) / 255.0
     nh, nw = (h // 14) * 14, (w // 14) * 14
@@ -58,44 +70,57 @@ def get_dino_features_bilinear(model, rgb_image, mask):
         c = feat.shape[-1]
         feat = feat.reshape(1, nh//14, nw//14, c).permute(0, 3, 1, 2)
     
-    v, u = np.where(mask)
-    if len(v) == 0: return np.zeros((0, c))
+    if len(uv_coords) == 0: 
+        return np.zeros((0, c))
 
-    u_norm, v_norm = (2.0 * u / (mask.shape[1] - 1)) - 1.0, (2.0 * v / (mask.shape[0] - 1)) - 1.0
+    # Normalize continuous float coordinates from [0, W-1] to PyTorch grid space [-1, 1]
+    u = uv_coords[:, 0]
+    v = uv_coords[:, 1]
+    u_norm = (2.0 * u / (w - 1)) - 1.0
+    v_norm = (2.0 * v / (h - 1)) - 1.0
+    
+    # Format grid as [1, 1, N, 2] for grid_sample
     grid = torch.stack([torch.tensor(u_norm), torch.tensor(v_norm)], dim=-1).view(1, 1, -1, 2).float().to(DEVICE)
-    return F.grid_sample(feat, grid, mode='bilinear', align_corners=True).squeeze().T.cpu().numpy()
+    
+    # Execute GPU-accelerated bilinear sampling
+    sampled_feats = F.grid_sample(feat, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+    
+    # Clean squeeze to output shape [N, C] safely
+    return sampled_feats.squeeze(0).squeeze(1).T.cpu().numpy()
 
 def get_utonia_features(backbone, pc_tensor, return_pointwise=False):
     """
     Extracts geometric features from the Utonia backbone.
-    If return_pointwise=True, it returns the (1, N, 1024) features.
+    Uses 3D Inverse Distance Weighting (IDW) interpolation to eliminate blocky patch artifacts.
     """
     with torch.no_grad():
         global_feat, (sparse_coords, point_feats) = backbone(pc_tensor)
     
     if return_pointwise:
-        # We need to map the output features back to the EXACT input point order.
-        # Since PointTransformer might subsample or shuffle via voxelization internally, 
-        # we use KDTree to map the output features back to the original pc_tensor order.
-        
-        # Ensure we are working with CPU numpy arrays for the KDTree
+        # 1. Extract sparse coordinates and features to CPU numpy arrays
         s_coords = sparse_coords.detach().cpu().numpy()[:, -3:]
         s_feats = point_feats.detach().cpu().numpy()
         
-        # Original input points
+        # Original continuous input points
         orig_pts = pc_tensor.squeeze(0).cpu().numpy()
         
-        # Map Utonia's output points to our input points
+        # 2. Build KDTree and query the 4 NEAREST neighbors instead of just 1
         tree = KDTree(s_coords)
-        _, indices = tree.query(orig_pts)
+        distances, indices = tree.query(orig_pts, k=4)
         
-        # Get the pointwise features in the correct order
-        aligned_point_feats = s_feats[indices]
+        # 3. Calculate Inverse Distance Weights
+        # Add a tiny epsilon (1e-8) to avoid dividing by zero if a point hits a coordinate perfectly
+        weights = 1.0 / (distances + 1e-8)
+        weights /= np.sum(weights, axis=1, keepdims=True) # Normalize weights to sum to 1.0
         
-        # Return as a tensor with batch dimension (1, N, 1024) to match expectations
+        # 4. Continuous 3D Interpolation: Multiply features by their weights and sum them up
+        # s_feats[indices] shape: [N, 4, 1024]
+        # weights[:, :, None] shape: [N, 4, 1]
+        aligned_point_feats = np.sum(s_feats[indices] * weights[:, :, None], axis=1)
+        
+        # Return as a tensor with batch dimension (1, N, 1024)
         return torch.from_numpy(aligned_point_feats).unsqueeze(0).to(pc_tensor.device)
         
-    # If not pointwise, return the global feature
     return global_feat
 
 def fuse_features(f1, f2):
@@ -114,12 +139,26 @@ def lift_to_world(depth, mask, K, pose):
     pts_h = np.hstack([pts_cam, np.ones((pts_cam.shape[0], 1))])
     return (pose @ pts_h.T).T[:, :3]
 
-def project_world_to_pixel(point_world, pose, K):
-    cam_h = np.linalg.inv(pose) @ np.append(point_world, 1.0)
-    pts_cam = cam_h[:3]
-    u = (pts_cam[0] * K['fx'] / pts_cam[2]) + K['cx']
-    v = (pts_cam[1] * K['fy'] / pts_cam[2]) + K['cy']
-    return np.array([[u, v]])
+def project_world_to_pixel(points_world, pose, K):
+    """
+    Projects 3D world points to 2D continuous pixel coordinates.
+    Supports both a single point [3] or an array of points [N, 3].
+    """
+    if points_world.ndim == 1:
+        points_world = points_world[None, :]
+        
+    # Convert to homogeneous coordinates [N, 4]
+    pts_h = np.hstack([points_world, np.ones((len(points_world), 1))])
+    
+    # Transform to camera space
+    cam_h = (np.linalg.inv(pose) @ pts_h.T).T
+    pts_cam = cam_h[:, :3]
+    
+    # Project to 2D continuous screen space
+    u = (pts_cam[:, 0] * K['fx'] / pts_cam[:, 2]) + K['cx']
+    v = (pts_cam[:, 1] * K['fy'] / pts_cam[:, 2]) + K['cy']
+    
+    return np.stack([u, v], axis=1)
 
 def voxel_fusion(points, features, voxel_size=0.015):
     coords = np.floor(points / voxel_size).astype(np.int32)

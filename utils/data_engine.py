@@ -94,7 +94,7 @@ class SceneDataEngine:
 
             pose, K = get_frame_info(self.meta, frame_key)
 
-            # --- Updated Dynamic Box Prompt Logic ---
+            # --- Dynamic Box Prompt Logic ---
             if i == 0:
                 # 1. Calculate 3D Anchor from Box Center
                 x1, y1, x2, y2 = initial_prompt
@@ -142,7 +142,7 @@ class SceneDataEngine:
                     current_box = [cp_u-100, cp_v-100, cp_u+100, cp_v+100]
 
             # --- Segmentation with BOX ---
-            # Pass box=current_box to your updated get_sam_mask utility
+            # Pass box=current_box to the get_sam_mask utility
             full_res_mask = get_sam_mask(self.sam, rgb, box=current_box)
             
             # Save verification (Now draws a rectangle)
@@ -160,8 +160,15 @@ class SceneDataEngine:
                              'cx': K['cx']*(depth.shape[1]/rgb.shape[1]), 
                              'cy': K['cy']*(depth.shape[0]/rgb.shape[0])})
 
+            # --- Lifting & Continuous Feature Extraction ---
+            # 1. Lift depth points to 3D world space as normal
             pts_world = lift_to_world(depth, mask_depth_res, K_scaled, pose)
-            dino_feats = get_dino_features_bilinear(self.dino, rgb, mask_depth_res)
+            
+            # 2. Project those exact 3D points back to continuous float coordinates on the high-res RGB image
+            uv_continuous = project_world_to_pixel(pts_world, pose, K)
+            
+            # 3. Sample DINO features at those exact continuous sub-pixel coordinates
+            dino_feats = get_dino_features_bilinear(self.dino, rgb, uv_continuous)
 
             all_points.append(pts_world)
             all_dino.append(dino_feats)
