@@ -27,9 +27,24 @@ def get_frame_info(meta, frame_key):
     return pose, {"fx": K_mat[0, 0], "fy": K_mat[1, 1], "cx": K_mat[0, 2], "cy": K_mat[1, 2]}
 
 # --- VISION & FEATURES ---
-def get_sam_mask(predictor, rgb, points):
+def get_sam_mask(predictor, rgb, box=None, points=None):
     predictor.set_image(rgb)
-    masks, scores, _ = predictor.predict(np.array(points), np.ones(len(points)), multimask_output=True)
+    
+    if box is not None:
+        # box format: [x1, y1, x2, y2]
+        masks, scores, _ = predictor.predict(
+            box=np.array(box),
+            multimask_output=True
+        )
+    elif points is not None:
+        masks, scores, _ = predictor.predict(
+            point_coords=np.array(points), 
+            point_labels=np.ones(len(points)), 
+            multimask_output=True
+        )
+    else:
+        raise ValueError("Either a box or points must be provided for SAM.")
+        
     return masks[np.argmax(scores)]
 
 def get_dino_features_bilinear(model, rgb_image, mask):
@@ -217,11 +232,51 @@ def save_barcode(embedding, save_path="desk_identity_barcode.png"):
     plt.close()
     print(f"📁 Global Embedding Barcode saved to: {save_path}")
 
-def save_verification_image(rgb, mask, prompt_points, save_path):
+def save_verification_image(rgb, mask, prompt_box, save_path):
     vis_img = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
     overlay = vis_img.copy()
+    
+    # Apply green mask overlay
     overlay[mask] = [0, 255, 0]
     cv2.addWeighted(overlay, 0.35, vis_img, 0.65, 0, vis_img)
-    for pt in prompt_points:
-        cv2.circle(vis_img, (int(pt[0]), int(pt[1])), 10, (0, 0, 255), -1)
+    
+    # Draw the Bounding Box instead of circles
+    # prompt_box expected as [x1, y1, x2, y2]
+    cv2.rectangle(
+        vis_img, 
+        (int(prompt_box[0]), int(prompt_box[1])), 
+        (int(prompt_box[2]), int(prompt_box[3])), 
+        (0, 0, 255), 
+        3  # Thickness
+    )
     cv2.imwrite(save_path, vis_img)
+
+def save_voxel_density_map(tensor, filename, title="Voxel Density Projection"):
+    """
+    Project a 5D voxel tensor [B, C, D, H, W] into a 2D Top-Down PNG map.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Ensure tensor is on CPU and detached
+    if hasattr(tensor, 'detach'):
+        tensor = tensor.detach().cpu()
+
+    # tensor shape: [1, C, D, H, W]
+    # Sum absolute features across channel dim to get occupancy/intensity
+    intensity = tensor[0].abs().sum(dim=0).numpy()
+    
+    # Max projection along the vertical axis (usually the first spatial dim after channels)
+    # This creates the top-down floorplan view
+    top_down = np.max(intensity, axis=0) 
+    
+    plt.figure(figsize=(8, 6))
+    # Use 'magma' or 'viridis' for high-contrast scientific visualization
+    im = plt.imshow(top_down, cmap='magma', origin='lower')
+    plt.colorbar(im, label='Aggregate Feature Intensity')
+    plt.title(title)
+    plt.axis('off') 
+    
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"   🎨 Map saved: {filename}")
