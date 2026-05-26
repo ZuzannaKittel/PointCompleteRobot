@@ -34,12 +34,12 @@ def visualize_saved_pair_truthful(pt_file_path):
     # Subplot 1: The Raw Scan
     ax1 = fig.add_subplot(131, projection='3d')
     ax1.scatter(partial_pts[:, 0], partial_pts[:, 1], partial_pts[:, 2], c=pca_colors, s=5)
-    ax1.set_title("Partial Scan (Normalized Space)")
+    ax1.set_title("Partial ScanNet++ Scan (Normalized Space)")
 
     # Subplot 2: The GT CAD
     ax2 = fig.add_subplot(132, projection='3d')
     ax2.scatter(gt_pts[:, 0], gt_pts[:, 1], gt_pts[:, 2], c='blue', s=5, alpha=0.3)
-    ax2.set_title("GT ShapeNet CAD")
+    ax2.set_title("GT Scannotate++ CAD (Normalized Space)")
 
     # Subplot 3: The Overlay (The "Truth")
     # If this looks messy, it means the rotation matrix (R_pure) 
@@ -57,4 +57,4 @@ def visualize_saved_pair_truthful(pt_file_path):
     plt.show()
 
 # Usage
-visualize_saved_pair_truthful("./data/geometric_pairs_dataset/train/pair_00007_30966f4c6e_table_27.pt")
+visualize_saved_pair_truthful("./data/geometric_pairs_dataset/train/pair_00005_30966f4c6e_chair_24.pt")
