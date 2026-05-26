@@ -9,7 +9,7 @@ import sys
 import json
 import pickle
 import glob
-# 2. CRITICAL: import Open3D before PyTorch initializes CUDA hooks
+# 2. CRITICAL: Import Open3D BEFORE PyTorch sets up its CUDA hooks
 import open3d as o3d
 import torch
 import numpy as np
@@ -39,67 +39,84 @@ sys.modules['ScanNetAnnotation'] = scannet_mod
 
 
 def is_visible(world_pt, pose, K, img_shape):
-    # 1. Project a world point into camera coordinates.
+    # 1. Project to camera space
     # Ensure world_pt is [x, y, z, 1]
     world_pt_h = np.append(world_pt, 1.0)
     w2c = np.linalg.inv(pose)
     cam_pt = w2c @ world_pt_h
-
-    # Reject points behind the camera.
+    
+    # Check if point is behind the camera
     if cam_pt[2] <= 0:
         return False
-
-    # 2. Project to pixel coordinates.
+        
+    # 2. Project to pixel space
     u = (cam_pt[0] * K["fx"] / cam_pt[2]) + K["cx"]
     v = (cam_pt[1] * K["fy"] / cam_pt[2]) + K["cy"]
-
-    # 3. Check whether the projection lies inside the image.
+    
+    # 3. Check bounds
     return (0 <= u < img_shape[1]) and (0 <= v < img_shape[0])
 
 def find_multi_view_frames(world_center, camera_json_data, scene_root, num_frames=5):
-    # Debug output for visibility selection.
+    # --- DEBUGGING LINE ---
     print(f"DEBUG: Input camera_json_data has {len(camera_json_data)} frames.")
     print(f"DEBUG: Processing object at {world_center}")
     valid_frames = []
 
     for frame_key, entry in camera_json_data.items():
-        if not frame_key.startswith("frame_"):
-            continue
-
+        if not frame_key.startswith("frame_"): continue
+        
         # 1. Get Camera Pose
         pose = np.array(entry.get('aligned_pose', np.eye(4)))
-
-        # 2. Get per-frame intrinsics or fall back to a default pinhole model.
+        # 2. Get Intrinsics (Need to load K)
+        # Inside find_multi_view_frames, retrieve the frame's specific intrinsics
+        # Retrieve the raw intrinsic matrix from JSON
+        # Usually it's either named 'intrinsics' or 'intrinsic'
         raw_k = entry.get('intrinsics') or entry.get('intrinsic')
+        
         if raw_k is None:
+            # Fallback if not found in frame (some datasets store it in a global header)
+            # Or just use your default
             K_dict = {'fx': 525, 'fy': 525, 'cx': 320, 'cy': 240}
         else:
+            # 2. Convert to numpy array to handle list-of-lists or flat list formats
             K_mat = np.array(raw_k)
+            
+            # 3. Extract the components (assuming 3x3 or 4x4 matrix)
+            # K = [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
             K_dict = {
                 'fx': K_mat[0, 0],
                 'fy': K_mat[1, 1],
                 'cx': K_mat[0, 2],
                 'cy': K_mat[1, 2]
             }
-
-        # 3. Filter by distance and field-of-view visibility.
-        cam_position = pose[:3, 3]  # Camera position is the right-most column.
+        
+        # 3. Check Distance AND Visibility
+        cam_position = pose[:3, 3] # Camera position is the right-most column
         dist = np.linalg.norm(cam_position - world_center)
-        if 0.3 < dist < 6.0 and is_visible(world_center, pose, K_dict, (1440, 1920)):
-            valid_frames.append((int(frame_key.split("_")[1]), dist))
+        if 0.3 < dist < 6.0: # Only consider frames where the camera is reasonably close to the object
+            # ONLY include if the camera is actually looking at the object center
+            if is_visible(world_center, pose, K_dict, (1440, 1920)): # Adjust resolution
+                valid_frames.append((int(frame_key.split("_")[1]), dist))
+                
+    if not valid_frames: return None
 
-    if not valid_frames:
-        return None
-
-    # Sort frames by frame index.
+    # 2. Sort by frame index
     valid_frames.sort(key=lambda x: x[0])
-
-    # Spread samples evenly across the valid frame range.
+    
+    # 3. DIVERSITY SAMPLING:
+    # Instead of focusing on the 'center_idx' (the closest approach),
+    # we take the full range of 'valid_frames' and pick points evenly
+    # distributed throughout the whole duration of visibility.
+    
     if len(valid_frames) <= num_frames:
         return [f[0] for f in valid_frames]
-
+    
+    # Use linspace to pick N frames spread evenly across the entire list
+    # This guarantees we don't just get a cluster from the 'closest' moment
     indices = np.linspace(0, len(valid_frames) - 1, num_frames, dtype=int)
-    return [valid_frames[i][0] for i in indices]
+    sampled_frames = [valid_frames[i][0] for i in indices]
+    
+    return sampled_frames
 
 
 def generate_universal_dataset(base_data_dir, output_dir, target_categories, checkpoint_path):
@@ -134,7 +151,6 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
         with open(paths["pkl"], "rb") as f: 
             annotation_obj = pickle.load(f)
 
-        # Initialize scene engine with loaded backbones.
         engine = SceneDataEngine(
             paths=paths, 
             sam=sam, 
@@ -155,7 +171,7 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
             annot_dict = getattr(obj, 'scan2cad_annotation_dict', {})
             obb_data = annot_dict.get('obb')
             
-            # Extract object transform matrix.
+            # Calculate transform here
             T_obj = obj.transform3d.get_matrix()[0].detach().cpu().numpy()
             print("\n==============================")
             print("OBJECT:", obj_id, raw_category)
@@ -171,13 +187,13 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
 
             print("==============================")
             T_obj = np.array(T_obj, dtype=np.float64, order='C')
-            world_center = T_obj[3, :3]  # Initial centroid from transform matrix.
+            world_center = T_obj[3, :3] # This is your REAL centroid
 
             if obb_data is None:
                 print(f"   ↳ ID {obj_id}: ⚠️ OBB missing from scan2cad dict.")
                 continue
             else:
-                # Override the transform-based centroid with the OBB geometric centroid.
+                # OVERRIDE with the true geometric centroid of the bounding box
                 world_center = np.array(obb_data['centroid'])
 
             print(f"DEBUG: Processing object ID {obj_id} at {world_center}")
@@ -210,7 +226,7 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
                 print(f"   ❌ Extraction failed for ID {obj_id} at {world_center}: {e}")
                 continue
 
-            # Harvest ground truth CAD points.
+            # Harvest Ground Truth
             gt_points = engine.get_ground_truth(paths["pkl"], paths["shapenet"], obj_id, raw_category)
             if gt_points is None or len(gt_points) == 0:
                 print(f"      ⚠️ Skipping: ShapeNet CAD model missing.")
