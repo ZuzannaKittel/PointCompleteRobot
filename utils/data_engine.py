@@ -1,204 +1,312 @@
+import os
+import json
+from sympy import centroid
 import torch
 import numpy as np
-import cv2
-import os
 import trimesh
-import matplotlib.pyplot as plt
-from utils.utils import (load_data, load_metadata, get_frame_info, get_sam_mask, 
-                         get_dino_features_bilinear, lift_to_world, 
-                         project_world_to_pixel, voxel_fusion, 
-                         save_verification_image, get_utonia_features, fuse_features)
-from utils.gt_extractor_scannotatepp import extract_scannotate_gt
+import pickle
+from scipy.spatial import KDTree
+import cv2
 
 class SceneDataEngine:
     def __init__(self, paths, sam, dino, utonia):
-        """
-        paths: Dictionary containing 'json', 'mesh', and dataset roots.
-        sam: Initialized SAM predictor.
-        dino: Initialized DINOv2 model.
-        utonia: Initialized Utonia backbone.
-        """
         self.paths = paths
         self.sam = sam
+        print(f"DEBUG: Engine initialized. SAM type: {type(self.sam)}")
         self.dino = dino
         self.uto = utonia
-        self.meta = load_metadata(paths["json"])
+        with open(paths["json"], "r") as f:
+            self.meta = json.load(f)
 
-    def save_thesis_visuals(self, raw_pts, fused_pts, save_dir="figures"):
-        os.makedirs(save_dir, exist_ok=True)
+    def get_obb_mask(self, points, obb):
+
+        centroid = np.asarray(obb['centroid'], dtype=np.float64)
+        axes = np.asarray(
+            obb['normalizedAxes'],
+            dtype=np.float64
+        ).reshape(3, 3)
+        # normalize safety
+        axes = axes / (
+            np.linalg.norm(axes, axis=1, keepdims=True) + 1e-8
+        )
+        extents = np.asarray(
+            obb['axesLengths'],
+            dtype=np.float64
+        )
+        half_extents = extents * 0.5
+        # IMPORTANT: world -> local
+        pts_local = (points - centroid) @ axes.T
+
+        mask = np.all(
+            np.abs(pts_local) <= (half_extents + 0.02),
+            axis=1
+        )
+
+        pts_local_A = (points - centroid) @ axes
+        pts_local_B = (points - centroid) @ axes.T
+        mask_A = np.all(np.abs(pts_local_A) <= (half_extents + 0.02), axis=1)
+        mask_B = np.all(np.abs(pts_local_B) <= (half_extents + 0.02), axis=1)
+        print("mask_A count:", mask_A.sum())
+        print("mask_B count:", mask_B.sum())
+
+        return mask
+
+    def _run_utonia_on_points(self, points, num_pts):
+        pts_sampled = points.copy()
+        idx = np.random.choice(len(pts_sampled), num_pts, replace=(len(pts_sampled) < num_pts)).astype(np.int64)
+        pts_sampled = pts_sampled[idx]
         
-        # 1. Visualize (c): The "Raw" Lifted Stack (All frames combined)
-        fig = plt.figure(figsize=(10, 10))
-        ax = fig.add_subplot(111, projection='3d')
-        # We use a small alpha because the raw stack is very dense/messy
-        ax.scatter(raw_pts[:, 0], raw_pts[:, 1], raw_pts[:, 2], s=1, c='crimson', alpha=0.2)
-        ax.set_title("Accumulated Multi-View Points (Raw)")
-        ax.set_axis_off()
-        plt.savefig(f"{save_dir}/lifted_raw_stack.png", dpi=300, bbox_inches='tight')
-        plt.close()
+        u_input = torch.from_numpy(pts_sampled).float().unsqueeze(0).cuda()
+        with torch.no_grad():
+            outputs = self.uto(u_input)
+            
+        if isinstance(outputs, tuple):
+            _, internal_data = outputs
+            if isinstance(internal_data, tuple):
+                sparse_coords, point_feats = internal_data
+            else:
+                point_feats = internal_data
+                sparse_coords = pts_sampled
+        else:
+            sparse_coords = pts_sampled
+            point_feats = outputs
 
-        # 2. Visualize (d): After Voxel Fusion (Clean & Uniform)
-        fig = plt.figure(figsize=(10, 10))
-        ax = fig.add_subplot(111, projection='3d')
-        ax.scatter(fused_pts[:, 0], fused_pts[:, 1], fused_pts[:, 2], s=1, c='forestgreen', alpha=0.8)
-        ax.set_title("Unified Point Cloud (After 1.5cm Fusion)")
-        ax.set_axis_off()
-        plt.savefig(f"{save_dir}/fused_clean_cloud.png", dpi=300, bbox_inches='tight')
-        plt.close()
-    
-        print(f"✨ Thesis visuals saved to {save_dir}/")
+        if hasattr(sparse_coords, 'detach'): 
+            sparse_coords = sparse_coords.detach().cpu().numpy()
+            if sparse_coords.shape[-1] == 4:
+                sparse_coords = sparse_coords[:, -3:]
+        if hasattr(point_feats, 'detach'): 
+            point_feats = point_feats.detach().cpu().numpy()
 
-    def get_fused_object(self, frame_indices, initial_prompt, num_pts=16384, save_visuals=False):
-        """
-        Orchestrates the entire Phase 1-4 pipeline.
-        """
-        ## 1. Lift multi-view frames to world space
-        # We pass the box here
-        raw_pts, raw_dino, anchor = self._build_global_object(frame_indices, initial_prompt)
+        print("\n================ UTONIA DEBUG ================")
+        print("pts_sampled shape:", pts_sampled.shape)
+        print("sparse_coords shape:", np.shape(sparse_coords))
+        print("point_feats shape:", np.shape(point_feats))
+
+        if len(sparse_coords) < 4:
+            print("WARNING: sparse_coords too small, using identity fallback")
+            return pts_sampled, np.zeros((len(pts_sampled), 32)), idx
+
+        tree = KDTree(sparse_coords)
+        distances, indices = tree.query(pts_sampled, k=4)
+        weights = 1.0 / (distances + 1e-8)
+        weights /= np.sum(weights, axis=1, keepdims=True)
+        aligned_point_feats = np.sum(point_feats[indices] * weights[:, :, None], axis=1)
+
+        return pts_sampled, aligned_point_feats, idx
+
+    def get_ground_truth(self, pkl_path, shapenet_root, target_obj_id, category):
+        """Loads and normalizes the ground truth CAD model."""
+        with open(pkl_path, 'rb') as f:
+            scene_obj = pickle.load(f)
+
+        selected_box = next((b for b in scene_obj.obj_annotation_list if str(getattr(b, 'object_id', '')) == str(target_obj_id)), None)
+        if selected_box is None:
+            return None
+
+        cad_path = os.path.join(shapenet_root, selected_box.catid_cad, selected_box.id_cad, 'models', 'model_normalized.obj')
+        if not os.path.exists(cad_path):
+            return None
+
+        mesh = trimesh.load(cad_path, force='mesh')
+        gt_pts = mesh.sample(16384)
+
+        # Normalize GT
+        gt_centered = gt_pts - gt_pts.mean(axis=0)
+        gt_max_size = np.max(gt_centered.max(axis=0) - gt_centered.min(axis=0))
         
-        # 2. Voxel Fusion (Resolves spatial redundancy from multiple views)
-        f_pts, f_dino = voxel_fusion(raw_pts, raw_dino)
+        return (gt_centered / (gt_max_size + 1e-8)) * 0.9
 
-        # Optional: Save visuals before we sub-sample for Utonia
-        if save_visuals:
-            self.save_thesis_visuals(raw_pts, f_pts)
+    def get_multi_view_tsdf_object(self, frame_indices, obj_transform, obb_data, num_pts=8192):
+        from utils.utils import load_data, get_frame_info, project_world_to_pixel, get_dino_features_bilinear
 
-        # 3. Extract Utonia Geometry Features
-        s_pts, u_feats, sampled_indices = self._run_utonia_on_fused(f_pts, num_pts)
+        # Extract the native unaligned 4x4 matrix
+        matrix_np = (obj_transform.detach().cpu().numpy() if hasattr(obj_transform, 'detach') else np.array(obj_transform)).astype(np.float64)
+        T = matrix_np[3, :3]
 
-        # 4. Final Feature Fusion
-        # Slice the DINO features to match the sampled Utonia indices
-        d_feats = f_dino[sampled_indices]
-        fused_pointwise = fuse_features(u_feats, d_feats)
+        scene_root = os.path.dirname(self.paths["json"])
+        all_fused_points = []
+        best_K, best_rgb, best_c2w = None, None, None
 
-        return s_pts, u_feats, d_feats, fused_pointwise, anchor
+        # ============================================================
+        # 1. USE EVERYTHING IN ALIGNED SCANNET SPACE
+        # ============================================================
+        obb_center = np.array(obb_data['centroid']).astype(np.float64)
 
-    def _build_global_object(self, frame_indices, initial_prompt):
-        print("🌍 Phase 1: Multi-frame extraction (Bounding Box Mode)...")
-        all_points = []
-        all_dino = []
-        target_world_point = None 
-        last_pts_world = None # Used to refine the box in subsequent frames
+        print("OBB center:", obb_center)
+        print("matrix translation:", matrix_np[3, :3])
 
-        for i, idx in enumerate(frame_indices):
-            frame_key = f"frame_{idx:06d}"
-            scene_root = os.path.dirname(self.paths["json"])
+        obb_axes = np.array(obb_data['normalizedAxes']).reshape(3, 3).astype(np.float64)
+        extents = np.array(obb_data['axesLengths']).astype(np.float64)
+
+        # ============================================================
+        # 2. LOAD FRAMES AND PROJECT
+        # ============================================================
+        for i, f_idx in enumerate(frame_indices):
+            frame_key = f"frame_{f_idx:06d}"
             rgb_path = os.path.join(scene_root, "rgb", f"{frame_key}.jpg")
             dep_path = os.path.join(scene_root, "depth", f"{frame_key}.png")
-
-            try:
-                rgb, depth = load_data(rgb_path, dep_path)
-            except Exception as e:
-                print(f"  ❌ Skipping {frame_key}: {e}")
+            if not os.path.exists(dep_path):
                 continue
 
-            pose, K = get_frame_info(self.meta, frame_key)
+            rgb, depth = load_data(rgb_path, dep_path)
+            frame_entry = self.meta[frame_key]
 
-            # --- Dynamic Box Prompt Logic ---
-            if i == 0:
-                # 1. Calculate 3D Anchor from Box Center
-                x1, y1, x2, y2 = initial_prompt
-                center_u, center_v = (x1 + x2) / 2, (y1 + y2) / 2
-                
-                scale_u = depth.shape[1] / rgb.shape[1]
-                scale_v = depth.shape[0] / rgb.shape[0]
-                u_depth, v_depth = int(center_u * scale_u), int(center_v * scale_v)
-                
-                # Ensure we don't index out of bounds
-                u_depth = np.clip(u_depth, 0, depth.shape[1] - 1)
-                v_depth = np.clip(v_depth, 0, depth.shape[0] - 1)
-                
-                z = depth[v_depth, u_depth] 
-                fx_s, fy_s = K['fx'] * scale_u, K['fy'] * scale_v
-                cx_s, cy_s = K['cx'] * scale_u, K['cy'] * scale_v
-                
-                x = (u_depth - cx_s) * z / fx_s
-                y = (v_depth - cy_s) * z / fy_s
-                target_world_point = (pose @ np.array([x, y, z, 1.0]))[:3]
-                
-                current_box = np.array(initial_prompt)
-                print(f"  📌 Box Anchor -> World Center: {target_world_point}")
-            else:
-                # 2. Project the 3D Anchor to get the new box center
-                center_proj = project_world_to_pixel(target_world_point, pose, K) # returns [[u, v]]
-                cp_u, cp_v = center_proj[0]
-                
-                # We can estimate box size based on movement, but a robust way is to 
-                # take the bounding box of the points we found in the PREVIOUS frame 
-                # re-projected into this frame. 
-                if last_pts_world is not None:
-                    # Project all points from previous frame to current frame
-                    pts_h = np.hstack([last_pts_world, np.ones((len(last_pts_world), 1))])
-                    pts_cam = (np.linalg.inv(pose) @ pts_h.T).T[:, :3]
-                    
-                    u_proj = (pts_cam[:, 0] * K['fx'] / pts_cam[:, 2]) + K['cx']
-                    v_proj = (pts_cam[:, 1] * K['fy'] / pts_cam[:, 2]) + K['cy']
-                    
-                    # Create a box with a 10% padding margin for SAM
-                    pad = 20
-                    current_box = [np.min(u_proj)-pad, np.min(v_proj)-pad, np.max(u_proj)+pad, np.max(v_proj)+pad]
-                else:
-                    # Fallback: Square box around projected center
-                    current_box = [cp_u-100, cp_v-100, cp_u+100, cp_v+100]
-
-            # --- Segmentation with BOX ---
-            # Pass box=current_box to the get_sam_mask utility
-            full_res_mask = get_sam_mask(self.sam, rgb, box=current_box)
+            print("depth stats:", depth.min(), depth.max())
             
-            # Save verification (Now draws a rectangle)
-            verify_path = f"verify_frames/verify_{frame_key}.jpg"
-            save_verification_image(rgb, full_res_mask, current_box, verify_path)
+            c2w = np.array(frame_entry.get('aligned_pose')).astype(np.float64)
+            w2c = np.linalg.inv(c2w)
+
+            print("OBB centroid:", obb_center)
+            print("Camera position:", c2w[:3, 3])
+            print("Distance:", np.linalg.norm(obb_center - c2w[:3, 3]))
+
+            raw_k = frame_entry.get('intrinsics') or frame_entry.get('intrinsic')
+            K_mat = np.array(raw_k)
+            K = {
+                'fx': K_mat[0, 0], 'fy': K_mat[1, 1],
+                'cx': K_mat[0, 2], 'cy': K_mat[1, 2]
+            }
+
+            if i == len(frame_indices) // 2:
+                best_K, best_rgb, best_c2w = K, rgb, c2w
+
+            ## SAM MASKING (DYNAMIC 2D BBOX UPGRADE)
+            self.sam.set_image(rgb)
+
+            # 1. Calculate all 8 corners of the 3D OBB in World Space
+            h = extents * 0.5
+            local_corners = np.array([
+                [x, y, z] for x in [-h[0], h[0]] for y in [-h[1], h[1]] for z in [-h[2], h[2]]
+            ])
+            world_corners = obb_center + local_corners @ obb_axes
+
+            # 2. Project all 8 corners into the 2D image plane
+            pixels = []
+            for pt in world_corners:
+                px = project_world_to_pixel(pt, w2c, K)
+                # Force the output to a flat 1D array [u, v] to prevent (8, 1, 2) nesting
+                pixels.append(np.array(px).flatten()) 
             
-            # --- Lifting (Standard) ---
-            mask_depth_res = cv2.resize(full_res_mask.astype(np.uint8), 
-                                      (depth.shape[1], depth.shape[0]), 
-                                      interpolation=cv2.INTER_NEAREST).astype(bool)
+            # Now pixels will safely be shape (8, 2)
+            pixels = np.array(pixels)
+
+            # Clamp using the high-res RGB frame boundaries where SAM runs
+            img_h, img_w = rgb.shape[:2]
             
-            K_scaled = K.copy()
-            K_scaled.update({'fx': K['fx']*(depth.shape[1]/rgb.shape[1]), 
-                             'fy': K['fy']*(depth.shape[0]/rgb.shape[0]),
-                             'cx': K['cx']*(depth.shape[1]/rgb.shape[1]), 
-                             'cy': K['cy']*(depth.shape[0]/rgb.shape[0])})
-
-            # --- Lifting & Continuous Feature Extraction ---
-            # 1. Lift depth points to 3D world space as normal
-            pts_world = lift_to_world(depth, mask_depth_res, K_scaled, pose)
+            # These slices will now safely grab the X column [:, 0] and Y column [:, 1]
+            x_min = np.clip(np.min(pixels[:, 0]), 0, img_w - 1)
+            y_min = np.clip(np.min(pixels[:, 1]), 0, img_h - 1)
+            x_max = np.clip(np.max(pixels[:, 0]), 0, img_w - 1)
+            y_max = np.clip(np.max(pixels[:, 1]), 0, img_h - 1)
             
-            # 2. Project those exact 3D points back to continuous float coordinates on the high-res RGB image
-            uv_continuous = project_world_to_pixel(pts_world, pose, K)
+            bbox_2d = np.array([x_min, y_min, x_max, y_max], dtype=np.float32)
+
+            masks, scores, _ = self.sam.predict(box=bbox_2d, multimask_output=True)
+            mask_2d = masks[np.argmax(scores)]
             
-            # 3. Sample DINO features at those exact continuous sub-pixel coordinates
-            dino_feats = get_dino_features_bilinear(self.dino, rgb, uv_continuous)
+            # Align SAM mask size down to depth grid dimensions if they differ
+            if mask_2d.shape != depth.shape:
+                mask_2d = cv2.resize(mask_2d.astype(np.uint8), (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
 
-            all_points.append(pts_world)
-            all_dino.append(dino_feats)
-            last_pts_world = pts_world # Store for the next frame's box projection
-            print(f"  ✅ {frame_key} processed ({len(pts_world)} pts)")
-        
-        return np.vstack(all_points), np.vstack(all_dino), target_world_point
+            semantic_valid = (mask_2d > 0) & (depth > 0.1) & (depth < 4.5)
+            z_cam = depth[semantic_valid]
+            if len(z_cam) == 0:
+                continue
 
-    def _run_utonia_on_fused(self, points, num_pts):
-        print(f"🧠 Running Utonia Geometry Extraction on {num_pts} points...")
-        pts = points.copy()
-        
-        # Mandatory Utonia Normalization (Unit Sphere)
-        pts -= pts.mean(0)
-        pts /= (np.max(np.linalg.norm(pts, axis=1)) + 1e-8)
-        
-        idx = np.random.choice(len(pts), num_pts, replace=(len(pts) < num_pts)).astype(np.int64)
-        pts_s = pts[idx]
-        
-        u_input = torch.from_numpy(pts_s).float().unsqueeze(0).cuda()
-        
-        # Pointwise feature extraction
-        u_feats_pointwise = get_utonia_features(self.uto, u_input, return_pointwise=True)
-        
-        if u_feats_pointwise.dim() == 3:
-            u_feats_pointwise = u_feats_pointwise.squeeze(0)
+            h_dep, w_dep = depth.shape[:2]
+            v_grid, u_grid = np.indices((h_dep, w_dep))
+            u_valid = u_grid[semantic_valid]
+            v_valid = v_grid[semantic_valid]
 
-        return pts_s, u_feats_pointwise.cpu().numpy(), idx
+            # Dynamically scale camera intrinsics to match depth frame sizing
+            scale_x = w_dep / img_w
+            scale_y = h_dep / img_h
+            
+            fx_depth = K["fx"] * scale_x
+            fy_depth = K["fy"] * scale_y
+            cx_depth = K["cx"] * scale_x
+            cy_depth = K["cy"] * scale_y
 
-    def get_ground_truth(self, pkl_path, shapenet_root, anchor):
-        print("\n💎 Phase 2.5: Harvesting High-Fidelity CAD Ground Truth...")
-        gt_points, gt_metadata = extract_scannotate_gt(pkl_path, shapenet_root, anchor)
-        return gt_points
+            x_cam = (u_valid - cx_depth) * z_cam / fx_depth
+            y_cam = (v_valid - cy_depth) * z_cam / fy_depth
+            
+            pts_cam = np.stack([x_cam, y_cam, z_cam, np.ones_like(z_cam)], axis=-1)
+            pts_world = (c2w @ pts_cam.T).T[:, :3]
+
+            if np.isnan(pts_world).any():
+                continue
+
+            crop_mask = self.get_obb_mask(pts_world, obb_data)
+            pts_cropped = pts_world[crop_mask]
+
+            if len(pts_cropped) == 0:
+                print("EMPTY OBB CROP")
+                continue
+
+            if len(pts_cropped) < 300:
+                print("   ⚠️ rejected frame due to low point count:", len(pts_cropped))
+                continue
+
+            if len(pts_cropped) > 10:
+                all_fused_points.append(pts_cropped)
+
+        # ============================================================
+        # 3. CHECK FUSION
+        # ============================================================
+        if not all_fused_points:
+            raise ValueError("Fusion failed: No valid geometry extracted.")
+
+        pts_world_all = np.concatenate(all_fused_points, axis=0)
+        balanced = []
+        max_per_frame = 3000
+
+        for chunk in all_fused_points:
+            if len(chunk) > max_per_frame:
+                idx = np.random.choice(len(chunk), max_per_frame, replace=False)
+                chunk = chunk[idx]
+            balanced.append(chunk)
+
+        pts_world_all = np.concatenate(balanced, axis=0)
+
+        # ============================================================
+        # 4. CANONICALIZATION (ALIGNING TO TRUE ANNOTATED OBB FRAME)
+        # ============================================================
+        local_pts = (pts_world_all - obb_center) @ obb_axes.T
+
+        # ============================================================
+        # 5. VOXEL DOWNSAMPLE & NORMALIZE
+        # ============================================================
+        voxel_coords = np.round(local_pts / 0.005).astype(np.int32)
+        _, unique_indices = np.unique(voxel_coords, axis=0, return_index=True)
+        final_pts_local = local_pts[unique_indices]
+
+        shape_center = np.median(final_pts_local, axis=0)
+        clean_pts_centered = final_pts_local - shape_center
+
+        extent = clean_pts_centered.max(axis=0) - clean_pts_centered.min(axis=0)
+        max_size = np.max(extent)
+        clean_pts_canonical = clean_pts_centered / (max_size + 1e-8) * 0.9
+
+        # ============================================================
+        # 6. DINO FEATURES (EXACT UNALIGNED WORLD REPROJECTION)
+        # ============================================================
+        # Project local points back to Aligned World space for pixel lookup
+        clean_pts_world_actual = final_pts_local @ obb_axes + obb_center
+        
+        w2c_best = np.linalg.inv(best_c2w)
+        uv_continuous = project_world_to_pixel(clean_pts_world_actual, w2c_best, best_K)
+        d_feats = get_dino_features_bilinear(self.dino, best_rgb, uv_continuous)
+
+        # ============================================================
+        # 7. UTONIA FEATURES & FUSION
+        # ============================================================
+        s_pts, u_feats, sampled_indices = self._run_utonia_on_points(clean_pts_canonical, num_pts)
+        d_feats = d_feats[sampled_indices]
+
+        fused_pointwise = np.hstack([
+            (u_feats.detach().cpu().numpy() if hasattr(u_feats, 'detach') else u_feats),
+            d_feats
+        ])
+
+        return s_pts, u_feats, d_feats, fused_pointwise, T

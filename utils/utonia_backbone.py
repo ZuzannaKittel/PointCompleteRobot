@@ -38,27 +38,32 @@ class UtoniaBackbone(nn.Module):
         if not torch.isfinite(x).all():
             x = torch.nan_to_num(x, nan=0.0)
 
-        # Preparing data for Sparse Convolution
         coord = x.view(-1, 3) 
         feat = x.view(-1, 3)  
         batch = torch.arange(B, device=x.device).repeat_interleave(N)
         
         data_dict = {"coord": coord, "feat": feat, "batch": batch, "grid_size": 0.005}
+        
+        # Call the underlying compiled network model
         output = self.model(data_dict)
         
-        # --- CRITICAL CHANGE HERE ---
-        # We must use the coordinates that the model actually outputted
+        # Safely extract values out of the custom Pointcept PointTensor structure
         actual_coords = output.coord if hasattr(output, 'coord') else output['coord']
         point_features = output.feat if hasattr(output, 'feat') else output['feat']
         point_batch = output.batch if hasattr(output, 'batch') else output['batch']
         
-        # 1. Global Features for training
-        res = torch.zeros((B, point_features.shape[-1]), device=x.device)
-        res = res.index_reduce_(0, point_batch, point_features, reduce='amax', include_self=False)
+        # Global max aggregation across batch elements
+        res_list = []
+        for b in range(B):
+            mask = (point_batch == b)
+            if mask.any():
+                max_feat = point_features[mask].max(dim=0)[0]
+            else:
+                max_feat = torch.zeros(point_features.shape[-1], device=x.device)
+            res_list.append(max_feat)
+            
+        res = torch.stack(res_list, dim=0)
         global_feat = self.proj(res)
-
-        # 2. Per-Point Features for Debug
         per_point_feat = self.proj(point_features) 
         
-        # Return coordinates and features from the same output object
         return global_feat, (actual_coords, per_point_feat)
