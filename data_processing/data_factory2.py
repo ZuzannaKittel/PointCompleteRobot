@@ -227,7 +227,7 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
                 continue
 
             # Harvest Ground Truth
-            gt_points = engine.get_ground_truth(paths["pkl"], paths["shapenet"], obj_id, raw_category)
+            gt_points = engine.get_ground_truth(paths["pkl"], paths["shapenet"], obj_id, raw_category, obb_data)
             if gt_points is None or len(gt_points) == 0:
                 print(f"      ⚠️ Skipping: ShapeNet CAD model missing.")
                 continue

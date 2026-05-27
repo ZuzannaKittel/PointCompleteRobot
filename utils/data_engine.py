@@ -97,7 +97,7 @@ class SceneDataEngine:
 
         return pts_sampled, aligned_point_feats, idx
 
-    def get_ground_truth(self, pkl_path, shapenet_root, target_obj_id, category):
+    def get_ground_truth(self, pkl_path, shapenet_root, target_obj_id, category, obb_data):
         """Load and normalize the ground truth CAD model for the target object."""
         with open(pkl_path, 'rb') as f:
             scene_obj = pickle.load(f)
@@ -113,11 +113,18 @@ class SceneDataEngine:
         mesh = trimesh.load(cad_path, force='mesh')
         gt_pts = mesh.sample(16384)
 
-        # Normalize GT
-        gt_centered = gt_pts - gt_pts.mean(axis=0)
-        gt_max_size = np.max(gt_centered.max(axis=0) - gt_centered.min(axis=0))
+        # Assuming ShapeNet models are pre-centered. If not, center them via their bounding box center, 
+        # NOT the mean, to match the OBB logic.
+        gt_min = gt_pts.min(axis=0)
+        gt_max = gt_pts.max(axis=0)
+        gt_center = (gt_max + gt_min) / 2.0
+        gt_centered = gt_pts - gt_center
         
-        return (gt_centered / (gt_max_size + 1e-8)) * 0.9
+        # USE THE SHARED OBB SCALE
+        extents = np.asarray(obb_data['axesLengths'], dtype=np.float64)
+        shared_max_size = np.max(extents)
+        
+        return (gt_centered / (shared_max_size + 1e-8)) * 0.9
 
     def get_multi_view_tsdf_object(self, frame_indices, obj_transform, obb_data, num_pts=8192):
         from utils.utils import load_data, get_frame_info, project_world_to_pixel, get_dino_features_bilinear
@@ -270,21 +277,28 @@ class SceneDataEngine:
         # ============================================================
         # 4. CANONICALIZATION (ALIGN TO ANNOTATED OBB FRAME)
         # ============================================================
+        # This properly centers and rotates the points using the GT anchor
         local_pts = (pts_world_all - obb_center) @ obb_axes.T
 
         # ============================================================
-        # 5. VOXEL DOWNSAMPLE & NORMALIZE the canonical point cloud.
+        # 5. FILTERING & SHARED NORMALIZATION
         # ============================================================
+        # A. Voxel Downsample
         voxel_coords = np.round(local_pts / 0.005).astype(np.int32)
         _, unique_indices = np.unique(voxel_coords, axis=0, return_index=True)
         final_pts_local = local_pts[unique_indices]
 
-        shape_center = np.median(final_pts_local, axis=0)
-        clean_pts_centered = final_pts_local - shape_center
+        # B. Statistical Outlier Removal (Cleans the floating noise)
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(final_pts_local)
+        cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        clean_pts_centered = np.asarray(pcd.points)[ind] # Already centered via OBB!
 
-        extent = clean_pts_centered.max(axis=0) - clean_pts_centered.min(axis=0)
-        max_size = np.max(extent)
-        clean_pts_canonical = clean_pts_centered / (max_size + 1e-8) * 0.9
+        # C. Shared Normalization (Use OBB size, NOT partial scan size)
+        # extents is obb_data['axesLengths']
+        shared_max_size = np.max(extents) 
+        clean_pts_canonical = clean_pts_centered / (shared_max_size + 1e-8) * 0.9
 
         # ============================================================
         # 6. DINO FEATURES (project canonical points back into RGB frame).
