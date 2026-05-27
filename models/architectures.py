@@ -1,13 +1,12 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-# --- 1. The Compression Network (3D U-Net with 2 downsampling layers) ---
 class SLatCompressor(nn.Module):
     def __init__(self, in_channels=1408, out_channels=8):
         super().__init__()
         leak = 0.2 
         
-        # Encoder (downsampling path)
         self.enc1 = nn.Sequential(
             nn.Conv3d(in_channels, 256, kernel_size=3, padding=1),
             nn.BatchNorm3d(256),
@@ -28,7 +27,6 @@ class SLatCompressor(nn.Module):
         )
         self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)
         
-        # Bottleneck
         self.bottleneck = nn.Sequential(
             nn.Conv3d(128, 64, kernel_size=3, padding=1),
             nn.BatchNorm3d(64),
@@ -38,7 +36,6 @@ class SLatCompressor(nn.Module):
             nn.LeakyReLU(leak, inplace=True),
         )
         
-        # Decoder (upsampling path)
         self.upsampler1 = nn.Upsample(scale_factor=2, mode='nearest')
         self.dec1 = nn.Sequential(
             nn.Conv3d(128 + 64, 128, kernel_size=3, padding=1),
@@ -58,7 +55,6 @@ class SLatCompressor(nn.Module):
             nn.BatchNorm3d(256),
             nn.LeakyReLU(leak, inplace=True),
         )
-        
         self.final = nn.Conv3d(256, out_channels, kernel_size=1)
 
     def forward(self, x):
@@ -75,19 +71,16 @@ class SLatCompressor(nn.Module):
         u2 = self.upsampler2(d1)
         u2 = torch.cat([u2, e1], dim=1)
         d2 = self.dec2(u2)
-        
         return self.final(d2)
-    
-# --- 2. The Spatial Compressor (Simple 3D CNN) ---
+
+
 class U3DGS_SpatialCompressor(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = nn.Sequential(
-            # 64^3 -> 32^3
             nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm3d(16),
             nn.LeakyReLU(0.2),
-            # 32^3 -> 16^3
             nn.Conv3d(16, 8, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm3d(8)
         )
@@ -95,35 +88,79 @@ class U3DGS_SpatialCompressor(nn.Module):
         return self.encoder(x)
 
 
-# --- MATHEMATICALLY ALIGNED VOXELIZATION ---
-def create_structured_latent(points, features, grid_res=64, workspace_radius=1.0):
-    """
-    Voxelizes points within a rigid, fixed 3D workspace.
-    Uses standard uniform grid division to match the decoder perfectly.
-    """
-    pts_t = torch.from_numpy(points).float().cuda()
-    feats_t = torch.from_numpy(features).float().cuda()
+class U3DGS_Decoder(nn.Module):
+    def __init__(self, bottleneck_channels=8, slat_channels=8):
+        super().__init__()
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose3d(bottleneck_channels, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(32),
+            nn.GELU()
+        )
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose3d(32, 16, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(16),
+            nn.GELU()
+        )
+        self.fusion_conv = nn.Sequential(
+            nn.Conv3d(16 + slat_channels, 32, kernel_size=3, padding=1),
+            nn.BatchNorm3d(32),
+            nn.GELU(),
+            nn.Conv3d(32, 16, kernel_size=3, padding=1),
+            nn.BatchNorm3d(16),
+            nn.GELU()
+        )
+        self.head_occupancy = nn.Sequential(
+            nn.Conv3d(16, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+        self.head_offsets = nn.Sequential(
+            nn.Conv3d(16, 3, kernel_size=1),
+            nn.Tanh()
+        )
+
+    def forward(self, u3dgs_16, slat_64):
+        x_32 = self.up1(u3dgs_16)
+        x_64 = self.up2(x_32) 
+        fused = torch.cat([x_64, slat_64], dim=1)
+        out_features = self.fusion_conv(fused)
+        return self.head_occupancy(out_features), self.head_offsets(out_features)
+
+
+class ObjectX_System(nn.Module):
+    def __init__(self, in_channels=1408):
+        super().__init__()
+        self.encoder_64 = SLatCompressor(in_channels=in_channels, out_channels=8)
+        self.compressor_16 = U3DGS_SpatialCompressor()
+        self.decoder = U3DGS_Decoder(bottleneck_channels=8, slat_channels=8)
+
+    def forward(self, voxel_grid, mask_64):
+        slat_64 = self.encoder_64(voxel_grid) * mask_64
+        u3dgs_16 = self.compressor_16(slat_64)
+        
+        # Eliminate bottleneck background leaks
+        mask_16 = F.max_pool3d(mask_64, kernel_size=4, stride=4)
+        u3dgs_16 = u3dgs_16 * mask_16
+        
+        occ, offsets = self.decoder(u3dgs_16, slat_64)
+        return {"slat": slat_64, "bottleneck": u3dgs_16, "occ": occ, "offsets": offsets}
     
-    min_bound = -workspace_radius
-    max_bound = workspace_radius
-    
-    # Map coordinates strictly from [-workspace_radius, +workspace_radius] to [0, 1]
-    pts_norm = (pts_t - min_bound) / (max_bound - min_bound)
-    
-    # ---  Use strict grid_res spacing rather than (grid_res - 1) ---
-    grid_coords = torch.clamp((pts_norm * grid_res).long(), 0, grid_res - 1)
-    
-    indices = grid_coords[:, 0] * (grid_res**2) + grid_coords[:, 1] * grid_res + grid_coords[:, 2]
-    
-    # Create the Feature Grid
-    C, V = feats_t.shape[1], grid_res**3
-    flat_grid = torch.zeros((C, V), device=feats_t.device)
-    flat_grid.index_reduce_(1, indices, feats_t.T, reduce='amax', include_self=False)
-    voxel_volume = flat_grid.view(1, C, grid_res, grid_res, grid_res)
-    
-    # Create the Occupancy Mask
-    mask_flat = torch.zeros(V, device=feats_t.device)
-    mask_flat.scatter_(0, indices, 1.0) 
-    occupancy_mask = mask_flat.view(1, 1, grid_res, grid_res, grid_res)
-    
-    return voxel_volume, occupancy_mask
+    def decode_from_results_oracle(self, results, min_bound, max_bound, threshold=0.5, grid_res=64):
+        """
+        Translates spatial predictions back into metric space using verified Oracle bounds.
+        """
+        occ = results['occ'].squeeze()        
+        offsets = results['offsets']          
+        
+        active_voxels = (occ > threshold).nonzero() 
+        if len(active_voxels) == 0:
+            return None
+
+        x_idx, y_idx, z_idx = active_voxels[:, 0], active_voxels[:, 1], active_voxels[:, 2]
+        point_offsets = offsets[0, :, x_idx, y_idx, z_idx].transpose(0, 1) 
+        
+        extent = max_bound - min_bound
+        voxel_size = extent / grid_res
+        
+        voxel_centers = min_bound + (active_voxels.float() + 0.5) * voxel_size
+        final_pts = voxel_centers + (point_offsets * (voxel_size / 2.0))
+        return final_pts.cpu().numpy()
