@@ -237,10 +237,10 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
                 "scene_id": scene_id,
                 "object_id": obj_id,
                 "category": raw_category,
-                "partial_pts": torch.from_numpy(s_pts).float(),
-                "partial_feats": torch.from_numpy(fused_pointwise).float(),
-                "gt_pts": torch.from_numpy(gt_points).float(),
-                "anchor_world": torch.from_numpy(world_center).float() # Uses true obb_center now
+                "partial_pts": torch.from_numpy(s_pts).half(), # Save space by using half precision for the raw points
+                "partial_feats": torch.from_numpy(fused_pointwise).half(), # Save space by using half precision for the raw features
+                "gt_pts": torch.from_numpy(gt_points).half(), # Save space by using half precision for the GT points
+                "anchor_world": torch.from_numpy(world_center).float() # Keep anchor float32 for precision
             }
 
             save_filename = os.path.join(
