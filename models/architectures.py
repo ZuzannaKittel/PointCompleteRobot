@@ -109,10 +109,9 @@ class U3DGS_Decoder(nn.Module):
             nn.BatchNorm3d(16),
             nn.GELU()
         )
-        self.head_occupancy = nn.Sequential(
-            nn.Conv3d(16, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
+
+        self.head_occupancy = nn.Conv3d(16, 1, kernel_size=1)
+
         self.head_offsets = nn.Sequential(
             nn.Conv3d(16, 3, kernel_size=1),
             nn.Tanh()
@@ -144,7 +143,7 @@ class ObjectX_System(nn.Module):
         occ, offsets = self.decoder(u3dgs_16, slat_64)
         return {"slat": slat_64, "bottleneck": u3dgs_16, "occ": occ, "offsets": offsets}
     
-    def decode_from_results_oracle(self, results, min_bound, max_bound, threshold=0.5, grid_res=64):
+    def decode_from_results_oracle(self, results, min_bound, max_bound, threshold=0.0, grid_res=64):
         """
         Translates spatial predictions back into metric space using verified Oracle bounds.
         """
