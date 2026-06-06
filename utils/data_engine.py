@@ -107,6 +107,7 @@ class SceneDataEngine:
             return None
 
         cad_path = os.path.join(shapenet_root, selected_box.catid_cad, selected_box.id_cad, 'models', 'model_normalized.obj')
+        print(f"   🔍 CAD Target: {cad_path} | Exists: {os.path.exists(cad_path)}")
         if not os.path.exists(cad_path):
             return None
 
@@ -127,6 +128,9 @@ class SceneDataEngine:
         return (gt_centered / (shared_max_size + 1e-8)) * 0.9
 
     def get_multi_view_tsdf_object(self, frame_indices, obj_transform, obb_data, num_pts=8192):
+        # This is the main function that extracts the multi-view TSDF object point cloud, 
+        # applies SAM masking, canonicalizes it to the OBB frame, and fuses DINO + Utonia features.
+        
         from utils.utils import load_data, get_frame_info, project_world_to_pixel, get_dino_features_bilinear
 
         # Extract the native 4x4 transform matrix and anchor translation.
@@ -141,8 +145,9 @@ class SceneDataEngine:
         # 1. USE EVERYTHING IN ALIGNED SCANNET SPACE
         # ============================================================
         obb_center = np.array(obb_data['centroid'], dtype=np.float64)
-        print("OBB center:", obb_center)
-        print("matrix translation:", matrix_np[3, :3])
+        # DEBUGGING: Print OBB and camera stats to verify they are in the expected range and location before projection.
+        """print("OBB center:", obb_center)
+        print("matrix translation:", matrix_np[3, :3])"""
 
         obb_axes = np.array(obb_data['normalizedAxes'], dtype=np.float64).reshape(3, 3)
         extents = np.array(obb_data['axesLengths'], dtype=np.float64)
@@ -160,14 +165,16 @@ class SceneDataEngine:
             rgb, depth = load_data(rgb_path, dep_path)
             frame_entry = self.meta[frame_key]
 
-            print("depth stats:", depth.min(), depth.max())
+            # DEBUGGING: Print depth stats to verify the depth map is valid and in the expected range (e.g., 0.1m to 4.5m for indoor scenes).
+            # print("depth stats:", depth.min(), depth.max())
             
             c2w = np.array(frame_entry.get('aligned_pose')).astype(np.float64)
             w2c = np.linalg.inv(c2w)
 
-            print("OBB centroid:", obb_center)
+            # DEBUGGING: Print camera and OBB stats to verify they are in the expected range and location.
+            """print("OBB centroid:", obb_center)
             print("Camera position:", c2w[:3, 3])
-            print("Distance:", np.linalg.norm(obb_center - c2w[:3, 3]))
+            print("Distance:", np.linalg.norm(obb_center - c2w[:3, 3]))"""
 
             # Extract camera intrinsics from the frame metadata.
             raw_k = frame_entry.get('intrinsics') or frame_entry.get('intrinsic')
@@ -238,6 +245,14 @@ class SceneDataEngine:
             
             pts_cam = np.stack([x_cam, y_cam, z_cam, np.ones_like(z_cam)], axis=-1)
             pts_world = (c2w @ pts_cam.T).T[:, :3]
+
+            # DEBUGGING: Print stats to verify the point cloud is in the expected location and scale.
+            """print("PTS mean:", pts_world.mean(axis=0))
+            print("OBB centroid:", obb_data["centroid"])
+            print("PTS min:", pts_world.min(axis=0))
+            print("PTS max:", pts_world.max(axis=0))
+            print("OBB center:", obb_center)
+            print("Distance:", np.linalg.norm(pts_world.mean(axis=0) - obb_data["centroid"]))"""
 
             if np.isnan(pts_world).any():
                 continue

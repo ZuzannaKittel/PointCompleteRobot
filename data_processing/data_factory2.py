@@ -129,7 +129,7 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
     uto = init_utonia(ckpt_path=checkpoint_path)
     sam = init_sam(os.path.join(PROJECT_ROOT, "checkpoints/weights/sam_vit_h_4b8939.pth"))
 
-    scene_paths = glob.glob(os.path.join(PROJECT_ROOT, base_data_dir, "data/*"))
+    scene_paths = glob.glob(os.path.join(PROJECT_ROOT, base_data_dir, "data/data/*"))
     pair_counter = 0
 
     for scene_path in tqdm(scene_paths, desc="Processing Scenes"):
@@ -137,11 +137,22 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
             continue
 
         scene_id = os.path.basename(scene_path)
+
+        # This skips the ghost folders (which does not contain "iphone" folder) 
+        # instantly before printing any debug statements
+        if not os.path.isdir(os.path.join(scene_path, "iphone")):
+            continue
+
         paths = {
             "json": os.path.join(scene_path, "iphone/pose_intrinsic_imu.json"),
             "pkl": os.path.join(PROJECT_ROOT, base_data_dir, f"annotations/{scene_id}/{scene_id}.pkl"),
             "shapenet": os.path.join(PROJECT_ROOT, "data/ShapeNet/ShapeNet_preprocessed")
         }
+
+        # --- FOR DEBUGGING ---
+        print(f"\nDEBUG checking scene: {scene_id}")
+        print(f" -> Looking for JSON at: {paths['json']} (Exists: {os.path.exists(paths['json'])})")
+        print(f" -> Looking for PKL at: {paths['pkl']} (Exists: {os.path.exists(paths['pkl'])})")
 
         if not os.path.exists(paths["pkl"]) or not os.path.exists(paths["json"]): 
             continue
@@ -219,7 +230,7 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
                     obb_data, 
                     num_pts=8192
                 )
-                print(f"   ✅ Saved training package: pair_{obj_id}_{raw_category}.pt")
+                print(f"   ☑️ Partial point cloud extracted with {s_pts.shape[0]} points and fused features of shape {fused_pointwise.shape}.")
             except Exception as e:
                 # Since world_center is defined at the top of the loop, 
                 # this print won't crash the program anymore.

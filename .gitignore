@@ -33,3 +33,7 @@ obsolete/
 
 # Ignore the SCANnotatepp files and scripts
 SCANnotatepp/
+
+# Ignore the scannetpp tools and common code
+/data_processing/scannetpp_common/
+*iphone*
