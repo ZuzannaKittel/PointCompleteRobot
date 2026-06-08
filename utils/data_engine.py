@@ -41,12 +41,12 @@ class SceneDataEngine:
         mask = np.all(np.abs(pts_local) <= (half_extents + 0.02), axis=1)
 
         # Diagnostic counts for alternative local axis orientations.
-        pts_local_A = (points - centroid) @ axes
+        """pts_local_A = (points - centroid) @ axes
         pts_local_B = (points - centroid) @ axes.T
         mask_A = np.all(np.abs(pts_local_A) <= (half_extents + 0.02), axis=1)
         mask_B = np.all(np.abs(pts_local_B) <= (half_extents + 0.02), axis=1)
         print("mask_A count:", mask_A.sum())
-        print("mask_B count:", mask_B.sum())
+        print("mask_B count:", mask_B.sum())"""
 
         return mask
 
@@ -97,35 +97,46 @@ class SceneDataEngine:
 
         return pts_sampled, aligned_point_feats, idx
 
-    def get_ground_truth(self, pkl_path, shapenet_root, target_obj_id, category, obb_data):
-        """Load and normalize the ground truth CAD model for the target object."""
-        with open(pkl_path, 'rb') as f:
-            scene_obj = pickle.load(f)
-
-        selected_box = next((b for b in scene_obj.obj_annotation_list if str(getattr(b, 'object_id', '')) == str(target_obj_id)), None)
-        if selected_box is None:
+    def get_ground_truth(self, selected_box, shapenet_root, category, obb_data):
+        """
+        Load and anisotropically scale the ground truth CAD model 
+        to match the true aspect ratio of the real-world object.
+        """
+        # Fix 1: Eliminate the I/O bottleneck by using the pre-loaded box object directly
+        if selected_box is None or not hasattr(selected_box, 'catid_cad'):
             return None
 
         cad_path = os.path.join(shapenet_root, selected_box.catid_cad, selected_box.id_cad, 'models', 'model_normalized.obj')
-        print(f"   🔍 CAD Target: {cad_path} | Exists: {os.path.exists(cad_path)}")
         if not os.path.exists(cad_path):
             return None
 
+        # Load and sample surface points
         mesh = trimesh.load(cad_path, force='mesh')
         gt_pts = mesh.sample(16384)
 
-        # Assuming ShapeNet models are pre-centered. If not, center them via their bounding box center, 
-        # NOT the mean, to match the OBB logic.
+        # 1. Calculate the current tight bounds of the raw CAD points
         gt_min = gt_pts.min(axis=0)
         gt_max = gt_pts.max(axis=0)
         gt_center = (gt_max + gt_min) / 2.0
+        
+        # Center the CAD points at the origin
         gt_centered = gt_pts - gt_center
         
-        # USE THE SHARED OBB SCALE
-        extents = np.asarray(obb_data['axesLengths'], dtype=np.float64)
-        shared_max_size = np.max(extents)
+        # 2. Determine the unique extent lengths of this specific CAD asset
+        cad_extents = gt_max - gt_min  # Shape: (3,) -> [length, width, height]
         
-        return (gt_centered / (shared_max_size + 1e-8)) * 0.9
+        # 3. Completely normalize the CAD per-axis into a clean unit cube [-0.5, 0.5]^3
+        gt_unit_cube = gt_centered / (cad_extents + 1e-8)
+        
+        # 4. Apply Anisotropic Scaling using real-world OBB proportions
+        real_extents = np.asarray(obb_data['axesLengths'], dtype=np.float64)  # Real object [L, W, H]
+        shared_max_size = np.max(real_extents)
+        
+        # Stretch/compress each axis to match the real-world aspect ratio inside canonical space
+        aspect_ratio_scale = real_extents / (shared_max_size + 1e-8)
+        gt_canonical = gt_unit_cube * aspect_ratio_scale * 0.9
+
+        return gt_canonical
 
     def get_multi_view_tsdf_object(self, frame_indices, obj_transform, obb_data, num_pts=8192):
         # This is the main function that extracts the multi-view TSDF object point cloud, 

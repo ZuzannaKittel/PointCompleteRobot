@@ -119,6 +119,93 @@ def find_multi_view_frames(world_center, camera_json_data, scene_root, num_frame
     return sampled_frames
 
 
+def find_multi_view_frames_vectorized(world_center, camera_json_data, num_frames=5):
+    """ 
+    Vectorized version of find_multi_view_frames. 
+    This is a critical function that is called for every single object during dataset generation, 
+    so optimizing it can have a huge impact on overall processing time. 
+    The original version iterates through each frame sequentially, 
+    which can be very slow when there are hundreds of frames per scene.
+    """
+    # 1. Filter out non-frame keys and track order
+    frame_keys = [k for k in camera_json_data.keys() if k.startswith("frame_")]
+    if not frame_keys:
+        return None
+        
+    # 2. Extract all poses into a single contiguous array of shape (N, 4, 4)
+    poses = np.array([camera_json_data[k].get('aligned_pose', np.eye(4)) for k in frame_keys], dtype=np.float64)
+    
+    # 3. Vectorized distance calculation: Extract all camera positions simultaneously
+    # The right-most column contains translation components: shape (N, 3)
+    cam_positions = poses[:, :3, 3] 
+    distances = np.linalg.norm(cam_positions - world_center, axis=1)
+    
+    # Apply distance threshold filter
+    in_range_mask = (distances > 0.3) & (distances < 6.0)
+    candidate_indices = np.where(in_range_mask)[0]
+    
+    if len(candidate_indices) == 0:
+        return None
+        
+    # Slice arrays to process only frames within the valid distance range
+    filtered_poses = poses[candidate_indices]
+    filtered_keys = [frame_keys[idx] for idx in candidate_indices]
+    filtered_distances = distances[candidate_indices]
+    
+    # 4. Apply the Rigid Inverse Trick in Batch
+    # Extract rotation matrices: shape (M, 3, 3)
+    R = filtered_poses[:, :3, :3]
+    # Extract translation vectors: shape (M, 3)
+    t = filtered_poses[:, :3, 3]
+    
+    # Transpose the batch of rotation matrices: shape (M, 3, 3)
+    R_T = R.transpose(0, 2, 1)
+    
+    # Compute camera space coordinates: X_cam = R_T @ X_world - R_T @ t
+    # 'mij,j->mi' contracts the (3,3) rotation with the (3,) world center across M frames
+    # 'mij,mj->mi' contracts the (3,3) rotation with the (M,3) translation vectors
+    cam_pts = np.einsum('mij,j->mi', R_T, world_center) - np.einsum('mij,mj->mi', R_T, t)
+    
+    # 5. Check Visibility 
+    # Points behind the camera camera space Z <= 0 are rejected
+    valid_z_mask = cam_pts[:, 2] > 0.0
+    
+    valid_frames = []
+    
+    # Process final perspective projections only on spatially viable candidate frames
+    for idx in np.where(valid_z_mask)[0]:
+        frame_key = filtered_keys[idx]
+        entry = camera_json_data[frame_key]
+        cam_pt = cam_pts[idx]
+        
+        # Retrieve or fallback intrinsics
+        raw_k = entry.get('intrinsics') or entry.get('intrinsic')
+        if raw_k is None:
+            K_mat = np.array([[525.0, 0.0, 320.0], [0.0, 525.0, 240.0], [0.0, 0.0, 1.0]])
+        else:
+            K_mat = np.array(raw_k)
+            
+        # Pin-hole projection equations
+        u = (cam_pt[0] * K_mat[0, 0] / cam_pt[2]) + K_mat[0, 2]
+        v = (cam_pt[1] * K_mat[1, 1] / cam_pt[2]) + K_mat[1, 2]
+        
+        # Symmetrical resolution bounds check (matching your 1920x1440 sensor configuration)
+        if (0 <= u < 1920) and (0 <= v < 1440):
+            frame_number = int(frame_key.split("_")[1])
+            valid_frames.append((frame_number, filtered_distances[idx]))
+            
+    if not valid_frames:
+        return None
+        
+    # 6. Uniform Trajectory Sampling
+    valid_frames.sort(key=lambda x: x[0])
+    if len(valid_frames) <= num_frames:
+        return [f[0] for f in valid_frames]
+        
+    indices = np.linspace(0, len(valid_frames) - 1, num_frames, dtype=int)
+    return [valid_frames[i][0] for i in indices]
+
+
 def generate_universal_dataset(base_data_dir, output_dir, target_categories, checkpoint_path):
     PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     absolute_output_dir = os.path.join(PROJECT_ROOT, output_dir, "train")
@@ -213,7 +300,7 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
 
             # --- 2. SAMPLING ---
             # Now pass the locally defined world_center
-            sweep_frames = find_multi_view_frames(world_center, camera_json_data, scene_root, num_frames=5)
+            sweep_frames = find_multi_view_frames_vectorized(world_center, camera_json_data, num_frames=5)
 
             if not sweep_frames:
                 print(f"   ↳ ID {obj_id} ({raw_category}): ⚠️ Skipped - No valid trajectory.")
@@ -238,7 +325,8 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
                 continue
 
             # Harvest Ground Truth
-            gt_points = engine.get_ground_truth(paths["pkl"], paths["shapenet"], obj_id, raw_category, obb_data)
+            #gt_points = engine.get_ground_truth(paths["pkl"], paths["shapenet"], obj_id, raw_category, obb_data)
+            gt_points = engine.get_ground_truth(obj, paths["shapenet"], raw_category, obb_data)
             if gt_points is None or len(gt_points) == 0:
                 print(f"      ⚠️ Skipping: ShapeNet CAD model missing.")
                 continue

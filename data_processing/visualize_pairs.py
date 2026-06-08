@@ -33,20 +33,20 @@ def visualize_saved_pair_truthful(pt_file_path):
     
     # Subplot 1: The Raw Scan
     ax1 = fig.add_subplot(131, projection='3d')
-    ax1.scatter(partial_pts[:, 0], partial_pts[:, 1], partial_pts[:, 2], c=pca_colors, s=5)
+    ax1.scatter(partial_pts[:, 0], partial_pts[:, 1], partial_pts[:, 2], c=pca_colors, s=1, alpha=0.8)
     ax1.set_title("Partial ScanNet++ Scan (Normalized Space)")
 
     # Subplot 2: The GT CAD
     ax2 = fig.add_subplot(132, projection='3d')
-    ax2.scatter(gt_pts[:, 0], gt_pts[:, 1], gt_pts[:, 2], c='blue', s=5, alpha=0.3)
+    ax2.scatter(gt_pts[:, 0], gt_pts[:, 1], gt_pts[:, 2], c='blue', s=1, alpha=0.3)
     ax2.set_title("GT Scannotate++ CAD (Normalized Space)")
 
     # Subplot 3: The Overlay (The "Truth")
     # If this looks messy, it means the rotation matrix (R_pure) 
     # in your data_factory2.py does not match the CAD's front-facing axis.
     ax3 = fig.add_subplot(133, projection='3d')
-    ax3.scatter(gt_pts[:, 0], gt_pts[:, 1], gt_pts[:, 2], c='gray', s=5, alpha=0.1)
-    ax3.scatter(partial_pts[:, 0], partial_pts[:, 1], partial_pts[:, 2], c=pca_colors, s=5, alpha=0.8)
+    ax3.scatter(gt_pts[:, 0], gt_pts[:, 1], gt_pts[:, 2], c='gray', s=1, alpha=0.2)
+    ax3.scatter(partial_pts[:, 0], partial_pts[:, 1], partial_pts[:, 2], c=pca_colors, s=1, alpha=0.5)
     ax3.set_title("Alignment Overlay")
 
     for ax in [ax1, ax2, ax3]:
@@ -57,4 +57,4 @@ def visualize_saved_pair_truthful(pt_file_path):
     plt.show()
 
 # Usage
-visualize_saved_pair_truthful("./data/geometric_pairs_dataset/train/pair_00001_7b6477cb95_table_17.pt")
+visualize_saved_pair_truthful("./data/geometric_pairs_dataset/train/pair_00002_7b6477cb95_table_17.pt")
