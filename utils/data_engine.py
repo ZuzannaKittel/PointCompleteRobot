@@ -102,7 +102,6 @@ class SceneDataEngine:
         Load and anisotropically scale the ground truth CAD model 
         to match the true aspect ratio of the real-world object.
         """
-        # Fix 1: Eliminate the I/O bottleneck by using the pre-loaded box object directly
         if selected_box is None or not hasattr(selected_box, 'catid_cad'):
             return None
 
@@ -128,6 +127,20 @@ class SceneDataEngine:
         # 3. Completely normalize the CAD per-axis into a clean unit cube [-0.5, 0.5]^3
         gt_unit_cube = gt_centered / (cad_extents + 1e-8)
         
+        # --- GLOBAL FIX: Universal +180-degree Y-axis rotation ---
+        # For theta = +180 degrees: cos(180) = -1, sin(180) = 0
+        # R_y = [[-1,  0,  0],
+        #        [ 0,  1,  0],
+        #        [ 0,  0, -1]]
+        R_y_180 = np.array([
+            [-1.0,  0.0,  0.0],
+            [ 0.0,  1.0,  0.0],
+            [ 0.0,  0.0, -1.0]
+        ], dtype=np.float64)
+    
+        gt_unit_cube = gt_unit_cube @ R_y_180.T
+        # --------------------------------------------------------
+        
         # 4. Apply Anisotropic Scaling using real-world OBB proportions
         real_extents = np.asarray(obb_data['axesLengths'], dtype=np.float64)  # Real object [L, W, H]
         shared_max_size = np.max(real_extents)
@@ -138,7 +151,7 @@ class SceneDataEngine:
 
         return gt_canonical
 
-    def get_multi_view_tsdf_object(self, frame_indices, obj_transform, obb_data, num_pts=8192):
+    def get_multi_view_tsdf_object(self, frame_indices, obj_transform, obb_data, num_pts=2048):
         # This is the main function that extracts the multi-view TSDF object point cloud, 
         # applies SAM masking, canonicalizes it to the OBB frame, and fuses DINO + Utonia features.
         
@@ -174,6 +187,9 @@ class SceneDataEngine:
                 continue
 
             rgb, depth = load_data(rgb_path, dep_path)
+            if depth.dtype == np.uint16:
+                depth = depth.astype(np.float64) / 1000.0  # Convert mm to meters
+
             frame_entry = self.meta[frame_key]
 
             # DEBUGGING: Print depth stats to verify the depth map is valid and in the expected range (e.g., 0.1m to 4.5m for indoor scenes).
@@ -207,9 +223,16 @@ class SceneDataEngine:
             # 2. Project all 8 corners into the 2D image plane
             pixels = []
             for pt in world_corners:
-                px = project_world_to_pixel(pt, w2c, K)
-                # Force the output to a flat 1D array [u, v] to prevent (8, 1, 2) nesting.
-                pixels.append(np.array(px).flatten()) 
+                # Transform to camera space first to check Z
+                pt_h = np.append(pt, 1.0)
+                cam_pt = w2c @ pt_h
+                if cam_pt[2] > 0.05:  # Only project points safely in front of the lens
+                    px = project_world_to_pixel(pt, w2c, K)
+                    pixels.append(np.array(px).flatten())
+
+            # Edge case safety check
+            if len(pixels) < 4: 
+                continue  # Skip frame if the camera is inside/overwhelmingly behind the box
             
             # Now pixels will safely be shape (8, 2)
             pixels = np.array(pixels)

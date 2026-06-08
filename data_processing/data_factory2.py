@@ -315,7 +315,7 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
                     sweep_frames, 
                     T_obj, 
                     obb_data, 
-                    num_pts=8192
+                    num_pts=2048 # Adjust based on the density you want in the partial point cloud (2048 is a common choice for training)
                 )
                 print(f"   ☑️ Partial point cloud extracted with {s_pts.shape[0]} points and fused features of shape {fused_pointwise.shape}.")
             except Exception as e:
