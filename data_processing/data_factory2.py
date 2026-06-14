@@ -241,21 +241,29 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
         os.path.join(absolute_output_dir, "pair_*.pt")
     )
 
-    if existing_files:
-        existing_ids = []
+    existing_ids = []
+    processed_scenes = set()
 
-        for f in existing_files:
-            try:
-                num = int(os.path.basename(f).split("_")[1])
-                existing_ids.append(num)
-            except Exception:
-                pass
+    for f in existing_files:
+        try:
+            name = os.path.basename(f)
 
-        pair_counter = max(existing_ids) + 1 if existing_ids else 0
-    else:
-        pair_counter = 0
+            # pair_01309_c0c863b72d_chair_1.pt
+            tokens = name[:-3].split("_")
+
+            pair_id = int(tokens[1])
+            scene_id = tokens[2]
+
+            existing_ids.append(pair_id)
+            processed_scenes.add(scene_id)
+
+        except Exception:
+            print(f"⚠️ Could not parse {f}")
+
+    pair_counter = max(existing_ids) + 1 if existing_ids else 0
 
     print(f"Starting pair_counter at {pair_counter}")
+    print(f"Found {len(processed_scenes)} completed scenes.")
 
     print("🤖 Initializing Foundation Backbones...")
     dino = init_dino()
@@ -270,6 +278,10 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
             continue
 
         scene_id = os.path.basename(scene_path)
+
+        if scene_id in processed_scenes:
+            print(f"⏭️ Scene {scene_id} already processed. Skipping.")
+            continue
 
         # This skips the ghost folders (which does not contain "iphone" folder) 
         # instantly before printing any debug statements
