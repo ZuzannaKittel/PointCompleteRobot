@@ -237,13 +237,33 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
     absolute_output_dir = os.path.join(PROJECT_ROOT, output_dir, "train")
     os.makedirs(absolute_output_dir, exist_ok=True)
 
+    existing_files = glob.glob(
+        os.path.join(absolute_output_dir, "pair_*.pt")
+    )
+
+    if existing_files:
+        existing_ids = []
+
+        for f in existing_files:
+            try:
+                num = int(os.path.basename(f).split("_")[1])
+                existing_ids.append(num)
+            except Exception:
+                pass
+
+        pair_counter = max(existing_ids) + 1 if existing_ids else 0
+    else:
+        pair_counter = 0
+
+    print(f"Starting pair_counter at {pair_counter}")
+
     print("🤖 Initializing Foundation Backbones...")
     dino = init_dino()
     uto = init_utonia(ckpt_path=checkpoint_path)
     sam = init_sam(os.path.join(PROJECT_ROOT, "checkpoints/weights/sam_vit_h_4b8939.pth"))
 
     scene_paths = glob.glob(os.path.join(PROJECT_ROOT, base_data_dir, "data/data/*"))
-    pair_counter = 0
+    #pair_counter = 0
 
     for scene_path in tqdm(scene_paths, desc="Processing Scenes"):
         if not os.path.isdir(scene_path): 
