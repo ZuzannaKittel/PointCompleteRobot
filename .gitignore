@@ -35,5 +35,4 @@ obsolete/
 SCANnotatepp/
 
 # Ignore the scannetpp tools and common code
-/data_processing/scannetpp_common/
-*iphone*
+/scannetpp_download/*

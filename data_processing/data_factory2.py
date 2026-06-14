@@ -119,24 +119,64 @@ def find_multi_view_frames(world_center, camera_json_data, scene_root, num_frame
     return sampled_frames
 
 
-def find_multi_view_frames_vectorized(world_center, camera_json_data, num_frames=5):
+def find_multi_view_frames_vectorized(world_center, camera_json_data, scene_path, num_frames=5):
     """ 
     Vectorized version of find_multi_view_frames. 
     This is a critical function that is called for every single object during dataset generation, 
     so optimizing it can have a huge impact on overall processing time. 
     The original version iterates through each frame sequentially, 
     which can be very slow when there are hundreds of frames per scene.
+    Ensure the frames are actually extracted on disk before proceeding with visibility checks. 
     """
-    # 1. Filter out non-frame keys and track order
-    frame_keys = [k for k in camera_json_data.keys() if k.startswith("frame_")]
+     
+    # 1. Identify which frames are ACTUALLY fully extracted on disk
+    rgb_dir = os.path.join(scene_path, "iphone", "rgb")
+    depth_dir = os.path.join(scene_path, "iphone", "depth")
+    
+    if not os.path.exists(rgb_dir) or not os.path.exists(depth_dir):
+        return None
+        
+    # Scan directories once to build a lightning-fast O(1) look-up set of frame IDs
+    try:
+        # Check for both .jpg and .png in the RGB folder!
+        available_rgb = {
+            int(f.split('_')[1].split('.')[0]) 
+            for f in os.listdir(rgb_dir) 
+            if f.startswith("frame_") and (f.endswith(".png") or f.endswith(".jpg"))
+        }
+        
+        # Depth maps are basically always .png
+        available_depth = {
+            int(f.split('_')[1].split('.')[0]) 
+            for f in os.listdir(depth_dir) 
+            if f.startswith("frame_") and f.endswith(".png")
+        }
+        
+        # A frame must have BOTH RGB and Depth present to be valid
+        fully_extracted_frames = available_rgb.intersection(available_depth)
+        
+    except Exception as e:
+        print(f"   ⚠️ Error parsing disk frames: {e}")
+        return None
+
+    # 2. Filter JSON keys: Only keep frames that are valid in metadata AND exist on disk
+    frame_keys = []
+    for k in camera_json_data.keys():
+        if k.startswith("frame_"):
+            try:
+                f_num = int(k.split("_")[1])
+                if f_num in fully_extracted_frames:
+                    frame_keys.append(k)
+            except (ValueError, IndexError):
+                continue
+                
     if not frame_keys:
         return None
         
-    # 2. Extract all poses into a single contiguous array of shape (N, 4, 4)
+    # 3. Extract all poses for existing frames into array of shape (N, 4, 4)
     poses = np.array([camera_json_data[k].get('aligned_pose', np.eye(4)) for k in frame_keys], dtype=np.float64)
     
-    # 3. Vectorized distance calculation: Extract all camera positions simultaneously
-    # The right-most column contains translation components: shape (N, 3)
+    # 4. Vectorized distance calculation
     cam_positions = poses[:, :3, 3] 
     distances = np.linalg.norm(cam_positions - world_center, axis=1)
     
@@ -147,49 +187,35 @@ def find_multi_view_frames_vectorized(world_center, camera_json_data, num_frames
     if len(candidate_indices) == 0:
         return None
         
-    # Slice arrays to process only frames within the valid distance range
     filtered_poses = poses[candidate_indices]
     filtered_keys = [frame_keys[idx] for idx in candidate_indices]
     filtered_distances = distances[candidate_indices]
     
-    # 4. Apply the Rigid Inverse Trick in Batch
-    # Extract rotation matrices: shape (M, 3, 3)
+    # 5. Apply the Rigid Inverse Trick in Batch
     R = filtered_poses[:, :3, :3]
-    # Extract translation vectors: shape (M, 3)
     t = filtered_poses[:, :3, 3]
-    
-    # Transpose the batch of rotation matrices: shape (M, 3, 3)
     R_T = R.transpose(0, 2, 1)
     
-    # Compute camera space coordinates: X_cam = R_T @ X_world - R_T @ t
-    # 'mij,j->mi' contracts the (3,3) rotation with the (3,) world center across M frames
-    # 'mij,mj->mi' contracts the (3,3) rotation with the (M,3) translation vectors
     cam_pts = np.einsum('mij,j->mi', R_T, world_center) - np.einsum('mij,mj->mi', R_T, t)
     
-    # 5. Check Visibility 
-    # Points behind the camera camera space Z <= 0 are rejected
+    # 6. Check Visibility (Z > 0)
     valid_z_mask = cam_pts[:, 2] > 0.0
-    
     valid_frames = []
     
-    # Process final perspective projections only on spatially viable candidate frames
     for idx in np.where(valid_z_mask)[0]:
         frame_key = filtered_keys[idx]
         entry = camera_json_data[frame_key]
         cam_pt = cam_pts[idx]
         
-        # Retrieve or fallback intrinsics
         raw_k = entry.get('intrinsics') or entry.get('intrinsic')
         if raw_k is None:
             K_mat = np.array([[525.0, 0.0, 320.0], [0.0, 525.0, 240.0], [0.0, 0.0, 1.0]])
         else:
             K_mat = np.array(raw_k)
             
-        # Pin-hole projection equations
         u = (cam_pt[0] * K_mat[0, 0] / cam_pt[2]) + K_mat[0, 2]
         v = (cam_pt[1] * K_mat[1, 1] / cam_pt[2]) + K_mat[1, 2]
         
-        # Symmetrical resolution bounds check (matching your 1920x1440 sensor configuration)
         if (0 <= u < 1920) and (0 <= v < 1440):
             frame_number = int(frame_key.split("_")[1])
             valid_frames.append((frame_number, filtered_distances[idx]))
@@ -197,7 +223,7 @@ def find_multi_view_frames_vectorized(world_center, camera_json_data, num_frames
     if not valid_frames:
         return None
         
-    # 6. Uniform Trajectory Sampling
+    # 7. Uniform Trajectory Sampling
     valid_frames.sort(key=lambda x: x[0])
     if len(valid_frames) <= num_frames:
         return [f[0] for f in valid_frames]
@@ -246,8 +272,14 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
 
         with open(paths["json"], 'r') as f: 
             camera_json_data = json.load(f)
-        with open(paths["pkl"], "rb") as f: 
-            annotation_obj = pickle.load(f)
+            
+        # GUARD 1: Prevent crash from truncated/corrupted pickle files
+        try:
+            with open(paths["pkl"], "rb") as f: 
+                annotation_obj = pickle.load(f)
+        except Exception as e:
+            print(f"\n❌ [SKIPPING SCENE] Annotation file for {scene_id} is corrupted: {e}")
+            continue
 
         engine = SceneDataEngine(
             paths=paths, 
@@ -265,62 +297,47 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
                 continue
 
             # --- 1. PRE-CALCULATE AND INITIALIZE ---
-            # We define world_center immediately so it is ALWAYS defined for the scope
             annot_dict = getattr(obj, 'scan2cad_annotation_dict', {})
             obb_data = annot_dict.get('obb')
             
-            # Calculate transform here
             T_obj = obj.transform3d.get_matrix()[0].detach().cpu().numpy()
-            print("\n==============================")
-            print("OBJECT:", obj_id, raw_category)
-
-            print("transform3d:", obj.transform3d)
-
-            mat = obj.transform3d.get_matrix()
-            print("raw matrix shape:", mat.shape)
-            print("raw matrix:", mat)
-
-            print("scan2cad_annotation_dict keys:",
-                getattr(obj, 'scan2cad_annotation_dict', {}).keys())
-
-            print("==============================")
             T_obj = np.array(T_obj, dtype=np.float64, order='C')
-            world_center = T_obj[3, :3] # This is your REAL centroid
+            world_center = T_obj[3, :3] 
 
             if obb_data is None:
                 print(f"   ↳ ID {obj_id}: ⚠️ OBB missing from scan2cad dict.")
                 continue
             else:
-                # OVERRIDE with the true geometric centroid of the bounding box
                 world_center = np.array(obb_data['centroid'])
 
             print(f"DEBUG: Processing object ID {obj_id} at {world_center}")
 
-            scene_root = os.path.dirname(paths["json"])
-
             # --- 2. SAMPLING ---
-            # Now pass the locally defined world_center
-            sweep_frames = find_multi_view_frames_vectorized(world_center, camera_json_data, num_frames=5)
+            # GUARD 2: Pass scene_path to ensure we only select frames that actually exist on disk
+            sweep_frames = find_multi_view_frames_vectorized(
+                world_center, 
+                camera_json_data, 
+                scene_path=scene_path, 
+                num_frames=5
+            )
 
-            if not sweep_frames:
-                print(f"   ↳ ID {obj_id} ({raw_category}): ⚠️ Skipped - No valid trajectory.")
+            # GUARD 3: Ensure we have enough real frames to perform a valid TSDF fusion
+            if not sweep_frames or len(sweep_frames) < 3:
+                print(f"   ↳ ID {obj_id} ({raw_category}): ⚠️ Skipped - Insufficient valid frames on disk.")
                 continue
             else: 
-                print(f"   ↳ ID {obj_id} ({raw_category}): Found {len(sweep_frames)} valid frames: {sweep_frames}")
+                print(f"   ↳ ID {obj_id} ({raw_category}): Found {len(sweep_frames)} valid frames on disk: {sweep_frames}")
 
             # --- 3. EXECUTION ---
             try:
-                # Pass the matrix T_obj, which the function uses to center the points
                 s_pts, u_feats, d_feats, fused_pointwise, _ = engine.get_multi_view_tsdf_object(
                     sweep_frames, 
                     T_obj, 
                     obb_data, 
-                    num_pts=2048 # Adjust based on the density you want in the partial point cloud (2048 is a common choice for training)
+                    num_pts=2048 
                 )
-                print(f"   ☑️ Partial point cloud extracted with {s_pts.shape[0]} points and fused features of shape {fused_pointwise.shape}.")
+                print(f"   ☑️ Partial point cloud extracted with {s_pts.shape[0]} points.")
             except Exception as e:
-                # Since world_center is defined at the top of the loop, 
-                # this print won't crash the program anymore.
                 print(f"   ❌ Extraction failed for ID {obj_id} at {world_center}: {e}")
                 continue
 

@@ -294,9 +294,9 @@ class SceneDataEngine:
             crop_mask = self.get_obb_mask(pts_world, obb_data)
             pts_cropped = pts_world[crop_mask]
 
-            if len(pts_cropped) == 0:
+            """if len(pts_cropped) == 0:
                 print("EMPTY OBB CROP")
-                continue
+                continue"""
 
             if len(pts_cropped) < 300:
                 print("   ⚠️ rejected frame due to low point count:", len(pts_cropped))
