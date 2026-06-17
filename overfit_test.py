@@ -20,26 +20,33 @@ def plot_diagnostic(tensor_volume, save_path, title):
     plt.savefig(save_path, dpi=300)
     plt.close()
 
-def plot_3d_point_cloud(points, save_path="diagnostic_outputs/03_reconstructed_pc.png"):
-    """Generates a static 3D scatter plot of the decoded points."""
+def plot_3d_point_cloud(points, save_path, title, limits=None):
+    """Generates a static 3D scatter plot with fixed axis bounds for direct comparison."""
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection='3d')
     
     # Color points by their Z height to visually show depth profile
     sc = ax.scatter(points[:, 0], points[:, 1], points[:, 2], 
-                    c=points[:, 2], cmap='viridis', s=5, alpha=0.8)
+                    c=points[:, 2], cmap='viridis', s=6, alpha=0.8)
     
     ax.set_xlabel('X (Meters)')
     ax.set_ylabel('Y (Meters)')
     ax.set_zlabel('Z (Meters)')
-    ax.set_title(f"Decoded Point Cloud ({len(points)} Points)")
+    ax.set_title(title, fontsize=14, pad=20)
     
-    # Adjust viewpoint for a clear perspective
+    # Lock the camera angle so both plots match perfectly
     ax.view_init(elev=20, azim=45)
     
+    # Force both plots to share the exact same spatial box
+    if limits is not None:
+        min_b, max_b = limits
+        ax.set_xlim(min_b[0], max_b[0])
+        ax.set_ylim(min_b[1], max_b[1])
+        ax.set_zlim(min_b[2], max_b[2])
+        
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"📸 Static 3D visual saved to: {save_path}")
+    print(f"📸 Visual saved to: {save_path}")
 
 if __name__ == "__main__":
     print("🚀 Initializing Single-Scene Overfit Engine...")
@@ -68,7 +75,6 @@ if __name__ == "__main__":
     model.train()
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    # Using Logits version for stability
     criterion_occ = nn.BCEWithLogitsLoss() 
 
     # 5. Pre-process Input
@@ -82,7 +88,7 @@ if __name__ == "__main__":
         optimizer.zero_grad()
         
         preds = model(voxel_in, mask_in)
-        logits = preds["occ"] # Raw output from the new Conv3d head
+        logits = preds["occ"] 
         
         loss = criterion_occ(logits, target_occupancy)
         
@@ -95,20 +101,41 @@ if __name__ == "__main__":
     # 7. Final Verification
     print("\n✅ Training Complete. Running final diagnostic...")
     model.eval()
-    os.makedirs("diagnostics", exist_ok=True)
-    
     with torch.no_grad():
-        final_preds = model(voxel_in, mask_in)
-        decoded = model.decode_from_results_oracle(final_preds, o_min, o_max)
+        # 🔴 FIX APPLIED: Changed mask_64 to mask_in
+        final_out = model(voxel_in, mask_in)
+        points = model.decode_from_results_oracle(final_out, o_min, o_max, threshold=0.0)
         
-    if decoded is not None:
-        print(f"✨ Successfully reconstructed {len(decoded)} points from the latent grid.")
-        print(f"Initial Loss: ~0.69 | Final Loss: {loss.item():.6f}")
+    if points is not None:
+        print(f"✨ Successfully reconstructed {len(points)} points from the latent grid.")
+        
+        # 1. Prepare bounds for matching aspect ratios
+        limits_tuple = (o_min.cpu().numpy(), o_max.cpu().numpy())
+        
+        # 2. Convert raw GPU partial points to NumPy for plotting
+        partial_pts_np = partial_pts.detach().cpu().numpy()
+        
+        # 3. Save the Partial Input Cloud
+        plot_3d_point_cloud(
+            partial_pts_np, 
+            save_path="diagnostics/partial_input_pc.png", 
+            title=f"Partial Input Point Cloud ({len(partial_pts_np)} Points)",
+            limits=limits_tuple
+        )
+        
+        # 4. Save the Reconstructed Cloud (using identical bounds)
+        plot_3d_point_cloud(
+            points, 
+            save_path="diagnostics/final_reconstructed_pc.png", 
+            title=f"Decoded Point Cloud ({len(points)} Points)",
+            limits=limits_tuple
+        )
 
-        plot_3d_point_cloud(decoded, save_path="diagnostics/final_reconstructed_pc.png")
-        print(f"📊 Final point cloud visualization saved to diagnostics/final_reconstructed_pc.png")
-    
-        plot_diagnostic(final_preds["slat"], "diagnostics/final_slat.png", "Final Latent Features")
-        print(f"📊 Final occupancy heatmap saved to diagnostics/final_slat.png")
+        # 5. Save the Occupancy Heatmap
+        plot_diagnostic(
+            final_out["occ"], 
+            save_path="diagnostics/occupancy_heatmap.png", 
+            title="Occupancy Logits Heatmap (64^3)"
+        )
     else:
-        print("⚠️ Warning: No points passed the occupancy threshold post-training.")
+        print("❌ Model failed to reconstruct any points above threshold.")
