@@ -6,7 +6,7 @@ class MultiModalFeatureEncoder(nn.Module):
     Takes pre-computed multi-modal point features (e.g. fused Utonia + DINOv2),
     projects them to a latent space, and pools them into a global shape embedding.
     """
-    def __init__(self, input_feat_dim=1024, latent_dim=512):
+    def __init__(self, input_feat_dim=2048, latent_dim=512):
         super().__init__()
         # NOTE: If your data factory fused_pointwise feature dimension is different 
         # (e.g., 768 or 1280), adjust 'input_feat_dim' to match it when instantiating.
