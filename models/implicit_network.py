@@ -13,10 +13,16 @@ class MultiModalFeatureEncoder(nn.Module):
         
         self.mlp = nn.Sequential(
             nn.Linear(input_feat_dim, 512),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(512, latent_dim),
-            nn.ReLU()
+            nn.GELU()
         )
+
+        self.latent_dim = latent_dim
+        self.output_dim = 2 * latent_dim
+
+        # Layer normalization to stabilize training and improve convergence
+        self.input_norm = nn.LayerNorm(input_feat_dim)
 
     def forward(self, partial_feats):
         """
@@ -26,7 +32,9 @@ class MultiModalFeatureEncoder(nn.Module):
             global_latent: [B, 2 * latent_dim] tensor representing the global shape embedding
         """
         # Step 1: Map complex fused features to latent shape space
-        x = self.mlp(partial_feats)  # [B, N, latent_dim]
+        # Apply layer normalization to stabilize training and improve convergence
+        x = self.mlp(self.input_norm(partial_feats))
+        #x = self.mlp(partial_feats)  # [B, N, latent_dim]
         
         # Step 2: Extract global shape priors via symmetric Max Pooling
         max_pool = torch.max(x, dim=1)[0]
@@ -37,6 +45,7 @@ class MultiModalFeatureEncoder(nn.Module):
             [max_pool, mean_pool],
             dim=-1
         )
+
         return global_latent
 
 
@@ -44,19 +53,19 @@ class ImplicitDecoder(nn.Module):
     """
     Decodes a continuous coordinate space conditioned on a multi-modal global latent shape vector.
     """
-    def __init__(self, latent_dim=512, hidden_dim=256):
+    def __init__(self, latent_dim=1024, hidden_dim=256):
         super().__init__()
         self.coord_encoder = nn.Sequential(
             nn.Linear(3, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
+            nn.GELU()
         )
         self.decoder = nn.Sequential(
             nn.Linear(hidden_dim + latent_dim, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim, 1)
         )
 
@@ -74,7 +83,7 @@ class ImplicitDecoder(nn.Module):
         coord_feats = self.coord_encoder(query_pts) # [B, Q, hidden_dim]
         
         # Broadcast the global descriptor to align with individual queries
-        latent_expanded = latent_vector.unsqueeze(1).repeat(1, Q, 1) # [B, Q, latent_dim]
+        latent_expanded = latent_vector.unsqueeze(1).expand(-1, Q, -1) # [B, Q, latent_dim]
         
         # Concatenate features and query continuous scalar fields
         combined = torch.cat([coord_feats, latent_expanded], dim=-1)

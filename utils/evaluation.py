@@ -120,7 +120,7 @@ def evaluate_test_set(encoder, decoder, test_dataset, device):
         for idx in range(len(test_dataset)):
             sample = test_dataset[idx]
             feats = sample['partial_feats'].to(device)
-            recon_pts = extract_implicit_shape(encoder, decoder, feats, device, resolution=96, threshold=0.8)
+            recon_pts = extract_implicit_shape(encoder, decoder, feats, device, resolution=128, threshold=0.8)
 
             if len(recon_pts) == 0:
                 continue

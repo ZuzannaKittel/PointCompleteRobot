@@ -72,7 +72,7 @@ if __name__ == "__main__":
     criterion = nn.BCEWithLogitsLoss()
 
     os.makedirs("runs/multimodal_baseline/snapshots", exist_ok=True)
-    epochs = 50
+    epochs = 75
 
     first_batch = next(iter(train_loader))
 
