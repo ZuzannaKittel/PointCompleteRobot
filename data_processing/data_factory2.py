@@ -5,6 +5,9 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPEN3D_NUM_THREADS"] = "1"
 
+import cv2
+cv2.setNumThreads(0)
+
 import sys
 import json
 import pickle
@@ -342,7 +345,7 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
             else:
                 world_center = np.array(obb_data['centroid'])
 
-            print(f"DEBUG: Processing object ID {obj_id} at {world_center}")
+            print(f"\nDEBUG: Processing object ID {obj_id} at {world_center}")
 
             # --- 2. SAMPLING ---
             # GUARD 2: Pass scene_path to ensure we only select frames that actually exist on disk

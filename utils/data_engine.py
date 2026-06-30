@@ -8,6 +8,7 @@ import torch
 import trimesh
 import open3d as o3d
 from scipy.spatial import KDTree
+from typing import Tuple
 
 
 def _matrix_to_intrinsics(raw_k):
@@ -18,6 +19,39 @@ def _matrix_to_intrinsics(raw_k):
         "cx": K_mat[0, 2],
         "cy": K_mat[1, 2],
     }
+
+def project_world_to_camera(points_world, w2c):
+    if points_world.ndim == 1:
+        points_world = points_world[None, :]
+    pts_h = np.hstack([points_world, np.ones((len(points_world), 1))])
+    cam = (w2c @ pts_h.T).T
+    return cam[:, :3]
+
+
+def project_to_pixel(points_cam, K):
+    x = points_cam[:, 0] / (points_cam[:, 2] + 1e-8)
+    y = points_cam[:, 1] / (points_cam[:, 2] + 1e-8)
+
+    u = K["fx"] * x + K["cx"]
+    v = K["fy"] * y + K["cy"]
+    return np.stack([u, v], axis=1)
+
+
+def inside_image(uv, shape):
+    h, w = shape[:2]
+    return (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+
+
+def sample_depth(depth, uv):
+    u = np.clip(np.round(uv[:, 0]).astype(int), 0, depth.shape[1] - 1)
+    v = np.clip(np.round(uv[:, 1]).astype(int), 0, depth.shape[0] - 1)
+    return depth[v, u]
+
+
+def mask_check(mask, uv):
+    u = np.clip(np.round(uv[:, 0]).astype(int), 0, mask.shape[1] - 1)
+    v = np.clip(np.round(uv[:, 1]).astype(int), 0, mask.shape[0] - 1)
+    return mask[v, u] > 0
 
 
 class SceneDataEngine:
@@ -39,7 +73,17 @@ class SceneDataEngine:
 
         # Transform points from world space into the OBB local frame.
         pts_local = (points - centroid) @ axes.T
-        mask = np.all(np.abs(pts_local) <= (half_extents + 0.05), axis=1)
+
+        #mask = np.all(np.abs(pts_local) <= (half_extents + 0.05), axis=1)
+
+        inside = np.all(np.abs(pts_local) <= half_extents, axis=1)
+
+        soft = np.linalg.norm(
+            np.maximum(0, np.abs(pts_local) - half_extents),
+            axis=1
+        )
+
+        mask = inside | (soft < 0.15 * np.max(half_extents))
 
         # Diagnostic counts for alternative local axis orientations.
         """pts_local_A = (points - centroid) @ axes
@@ -48,6 +92,20 @@ class SceneDataEngine:
         mask_B = np.all(np.abs(pts_local_B) <= (half_extents + 0.02), axis=1)
         print("mask_A count:", mask_A.sum())
         print("mask_B count:", mask_B.sum())"""
+
+        print("\nOBB DEBUG")
+        print("Half extents:", half_extents)
+        print("Local min:", pts_local.min(axis=0))
+        print("Local max:", pts_local.max(axis=0))
+
+        pts_local_A = (points - centroid) @ axes
+        pts_local_B = (points - centroid) @ axes.T
+
+        mask_A = np.all(np.abs(pts_local_A) <= half_extents, axis=1)
+        mask_B = np.all(np.abs(pts_local_B) <= half_extents, axis=1)
+
+        print("mask_A:", mask_A.sum())
+        print("mask_B:", mask_B.sum())
 
         return mask
 
@@ -154,6 +212,75 @@ class SceneDataEngine:
     
     def _tsdf_hash(self, p, voxel_size):
         return tuple(np.floor(p / voxel_size).astype(np.int32))
+    
+    def multiview_verify_points(self, points_world, selected_frames, depth_tol=0.03, confidence_thresh=0.5):
+        print("\nRunning global multi-view verification...")
+
+        support = np.zeros(len(points_world), dtype=np.float32)
+        visibility = np.zeros(len(points_world), dtype=np.float32)
+
+        for frame in selected_frames:
+            w2c = frame["w2c"]
+            K = frame["K"]
+            depth = frame["depth"]
+            mask = frame["mask"]
+
+            pts_h = np.hstack([points_world, np.ones((len(points_world), 1))])
+            pts_cam = (w2c @ pts_h.T).T[:, :3]
+
+            u = pts_cam[:, 0] * K["fx"] / (pts_cam[:, 2] + 1e-8) + K["cx"]
+            v = pts_cam[:, 1] * K["fy"] / (pts_cam[:, 2] + 1e-8) + K["cy"]
+
+            u = np.round(u).astype(np.int32)
+            v = np.round(v).astype(np.int32)
+
+            H, W = depth.shape
+
+            inside = ((pts_cam[:, 2] > 0.05) & (u >= 0) & (u < W) & (v >= 0) & (v < H))
+
+            visibility += inside.astype(np.float32)
+
+            idx = np.where(inside)[0]
+            if len(idx) == 0:
+                continue
+
+            measured_depth = depth[v[idx], u[idx]]
+            inside_mask = mask[v[idx], u[idx]]
+
+            depth_ok = np.abs(
+                pts_cam[idx, 2] - measured_depth
+            ) < depth_tol
+
+            good = depth_ok & inside_mask
+            support[idx] += good.astype(np.float32)
+        
+        confidence = support / np.maximum(visibility, 1)
+
+        print(
+            "Visibility:",
+            visibility.min(),
+            visibility.mean(),
+            visibility.max()
+        )
+
+        print(
+            "Support:",
+            support.min(),
+            support.mean(),
+            support.max()
+        )
+
+        print(
+            "Confidence:",
+            confidence.min(),
+            confidence.mean(),
+            confidence.max()
+        )
+        keep = confidence >= confidence_thresh
+        filtered = points_world[keep]
+        print("Verification kept", len(filtered), "/", len(points_world),"points")
+
+        return filtered
 
     def get_multi_view_tsdf_object(self, frame_indices, obj_transform, obb_data, num_pts=2048):
         # This is the main function that extracts the multi-view TSDF object point cloud, 
@@ -195,6 +322,8 @@ class SceneDataEngine:
         # ============================================================
         for i, f_idx in enumerate(frame_indices):
             frame_key = f"frame_{f_idx:06d}"
+            print(f"\n==============================")
+            print(f"Processing {frame_key}")
             rgb_path = os.path.join(scene_root, "rgb", f"{frame_key}.jpg")
             dep_path = os.path.join(scene_root, "depth", f"{frame_key}.png")
             if not os.path.exists(dep_path):
@@ -232,7 +361,17 @@ class SceneDataEngine:
             local_corners = np.array([
                 [x, y, z] for x in [-h[0], h[0]] for y in [-h[1], h[1]] for z in [-h[2], h[2]]
             ])
-            world_corners = obb_center + local_corners @ obb_axes
+
+            #world_corners = obb_center + local_corners @ obb_axes
+
+            obb_axes = obb_axes / (np.linalg.norm(obb_axes, axis=0, keepdims=True) + 1e-8)
+
+            world_corners = np.zeros_like(local_corners)
+
+            for i in range(3):
+                world_corners += np.outer(local_corners[:, i], obb_axes[:, i])
+
+            world_corners = world_corners + obb_center
 
             # 2. Project all 8 corners into the 2D image plane
             pixels = []
@@ -255,14 +394,27 @@ class SceneDataEngine:
             img_h, img_w = rgb.shape[:2]
             
             # These slices will now safely grab the X column [:, 0] and Y column [:, 1]
-            x_min = np.clip(np.min(pixels[:, 0]), 0, img_w - 1)
-            y_min = np.clip(np.min(pixels[:, 1]), 0, img_h - 1)
-            x_max = np.clip(np.max(pixels[:, 0]), 0, img_w - 1)
-            y_max = np.clip(np.max(pixels[:, 1]), 0, img_h - 1)
+            # padding added to stablize sam bbox
+            pad = 0.1  # 10% padding
+
+            x_min = np.min(pixels[:, 0])
+            y_min = np.min(pixels[:, 1])
+            x_max = np.max(pixels[:, 0])
+            y_max = np.max(pixels[:, 1])
+
+            dx = (x_max - x_min) * pad
+            dy = (y_max - y_min) * pad
+
+            x_min = np.clip(x_min - dx, 0, img_w - 1)
+            y_min = np.clip(y_min - dy, 0, img_h - 1)
+            x_max = np.clip(x_max + dx, 0, img_w - 1)
+            y_max = np.clip(y_max + dy, 0, img_h - 1)
             
             bbox_2d = np.array([x_min, y_min, x_max, y_max], dtype=np.float32)
 
+            print(">>> Running SAM...")
             masks, scores, _ = self.sam.predict(box=bbox_2d, multimask_output=True)
+            print(">>> SAM finished")
             mask_2d = masks[np.argmax(scores)]
             
             # Align SAM mask size to the depth image resolution when needed.
@@ -272,6 +424,9 @@ class SceneDataEngine:
             depth_valid = (depth > 0.1) & (depth < 4.5)
 
             semantic_valid = (mask_2d > 0) & (depth > 0.1) & (depth < 4.5)
+
+            if np.count_nonzero(semantic_valid) < 500:
+                continue
 
             print(
                 "Mask stats: \n",
@@ -303,29 +458,40 @@ class SceneDataEngine:
             y_cam = (v_valid - cy_depth) * z_cam / fy_depth
             
             pts_cam = np.stack([x_cam, y_cam, z_cam, np.ones_like(z_cam)], axis=-1)
+            print(">>> Backprojecting points...")
             pts_world = (c2w @ pts_cam.T).T[:, :3]
+            print(f">>> World points: {len(pts_world)}")
 
+            print(">>> Cropping with OBB...")
             crop_mask = self.get_obb_mask(pts_world, obb_data)
+            print(">>> OBB crop finished")
             pts_cropped = pts_world[crop_mask]
 
-            # ============================
-            # TSDF CONSISTENCY FILTER
-            # ============================
+            if len(pts_cropped) == 0:
+                print("⚠️ EMPTY CROPPED CLOUD — check OBB projection / SAM bbox")
+                continue
 
-            for p in pts_cropped:
-                key = self._tsdf_hash(p, voxel_size)
+            pts_verified_frame = pts_cropped
+            support = np.ones(len(pts_verified_frame), dtype=np.float32)
 
-                if key not in tsdf:
-                    tsdf[key] = p
-                    tsdf_count[key] = 1
-                else:
-                    tsdf_count[key] += 1
-                    tsdf[key] = (
-                        tsdf[key] * (tsdf_count[key] - 1) + p
-                    ) / tsdf_count[key]
+            # ============================================================
+            # SAFE OUTPUT (NO BROKEN INDEXING)
+            # ============================================================
 
-            # use the accumulated voxel representatives
-            pts_cropped = np.asarray(list(tsdf.values()))
+            support_mean = support.mean() if len(support) > 0 else 0.0
+
+            keep_ratio = (
+                len(pts_verified_frame) / (len(pts_cropped) + 1e-8)
+                if len(pts_cropped) > 0 else 0.0
+            )
+
+            print(
+                frame_key,
+                "cropped:", len(pts_cropped),
+                "verified:", len(pts_verified_frame),
+                "keep ratio:", keep_ratio,
+                "support mean:", support_mean
+            )
 
             print(
                 frame_key,
@@ -334,37 +500,55 @@ class SceneDataEngine:
                 "cropped pts:", len(pts_cropped)
             )
 
-            """if len(pts_cropped) == 0:
-                print("EMPTY OBB CROP")
-                continue"""
-            
-            # adaptive threshold AFTER TSDF filtering
-            min_points = 200  # hard lower bound for geometry
-            if len(pts_cropped) < min_points:
-                print("   ⚠️ rejected frame after TSDF:", len(pts_cropped))
+            # ============================================================
+            # FRAME FILTER
+            # ============================================================
+
+            min_points = 80 # to keep small but valid frames
+
+            if len(pts_verified_frame) < min_points:
+                print("   ⚠️ rejected frame:", len(pts_verified_frame))
                 continue
                             
             # Score based on the geometry richness and mask quality and consistency
             #score = len(pts_cropped) * (np.count_nonzero(semantic_valid) / (mask_2d.size + 1e-8))
-            coverage = len(pts_cropped)
+            coverage = len(pts_verified_frame)
             distance = np.median(depth[semantic_valid])
 
             score = coverage / (distance + 1e-6)
 
             if len(pts_cropped) > 10:
+                print(">>> Appending frame to frame_clouds")
                 frame_clouds.append({
-                    "points": pts_cropped,
+                    "raw_points": pts_world.copy(),
+                    "cropped_points": pts_cropped.copy(),
+                    "points": pts_verified_frame.copy(),
+
                     "score": score,
-                    "frame": frame_key
+                    "frame": frame_key,
+
+                    "mask": mask_2d.copy(),
+                    "semantic_valid": semantic_valid.copy(),
+                    "depth": depth.copy(),
+
+                    "K": K,
+                    "c2w": c2w,
+                    "w2c": w2c,
                 })
+                print(">>> Frame appended")
 
             print(frame_key, score)
+
+        print("\n==============================")
+        print("Finished processing ALL frames")
+        print("==============================")
 
         # ============================================================
         # 3. CHECK FUSION
         # ============================================================
-        if not frame_clouds:
-            raise ValueError("Fusion failed: No valid geometry extracted.")
+        if len(frame_clouds) < 2:
+            print("⚠️ Not enough good views — skipping object")
+            return None
 
         # ------------------------------------------------------------------
         # Rank frames by quality (currently: geometry richness and mask quality + closer, more detailes views)
@@ -374,9 +558,23 @@ class SceneDataEngine:
         max_frames = 12
         selected_frames = frame_clouds[:max_frames]
 
+        if debug_saved is False:
+
+            debug_package = {
+                "selected_frames": selected_frames,
+                "obb_center": obb_center,
+                "obb_axes": obb_axes,
+                "extents": extents,
+            }
+
+            torch.save(debug_package, "debug_multiview.pt")
+
+            debug_saved = True
+
         print("\nSelected frames:")
         for f in selected_frames:
             print(f"  {f['frame']}: {f['score']} points")
+            print(f"Finished processing {frame_key}")
 
         # Frame balancing
         max_per_frame = 2000
@@ -396,6 +594,9 @@ class SceneDataEngine:
 
         pts_world_all = np.concatenate(balanced, axis=0)
 
+        # Frames verification
+        pts_world_all = self.multiview_verify_points(pts_world_all, selected_frames)
+
         # ============================================================
         # 4. CANONICALIZATION (ALIGN TO ANNOTATED OBB FRAME)
         # ============================================================
@@ -406,12 +607,15 @@ class SceneDataEngine:
         # 5. FILTERING & SHARED NORMALIZATION
         # ============================================================
         # A. Voxel Downsample
+        debug_local_pts = local_pts.copy()
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(local_pts)
 
         pcd = pcd.voxel_down_sample(voxel_size=0.005)
 
         final_pts_local = np.asarray(pcd.points)
+
+        debug_voxel = final_pts_local.copy()
 
         # light trimming only (outlier suppression, not shape destruction)
         centroid = final_pts_local.mean(axis=0)
@@ -426,11 +630,13 @@ class SceneDataEngine:
         pcd.points = o3d.utility.Vector3dVector(final_pts_local)
         cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
         clean_pts_centered = np.asarray(pcd.points)[ind] # Already centered via OBB!
+        debug_clean = clean_pts_centered.copy()
 
         # C. Shared Normalization (Use OBB size, NOT partial scan size)
         # extents is obb_data['axesLengths']
         shared_max_size = np.max(extents) 
         clean_pts_canonical = clean_pts_centered / (shared_max_size + 1e-8) * 0.9
+        debug_canonical = clean_pts_canonical.copy()
 
         # ============================================================
         # 6. DINO FEATURES (project canonical points back into RGB frame).
@@ -448,7 +654,17 @@ class SceneDataEngine:
         # ============================================================
         # Extract Utonia point features on the canonical object shape.
         s_pts, u_feats, sampled_indices = self._run_utonia_on_points(clean_pts_canonical, num_pts)
+        debug_sampled = s_pts.copy()
         d_feats = d_feats[sampled_indices]
+
+        torch.save({
+            "merged": pts_world_all,
+            "local": debug_local_pts,
+            "voxel": debug_voxel,
+            "clean": debug_clean,
+            "canonical": debug_canonical,
+            "sampled": debug_sampled,
+        }, "debug_pipeline.pt")
 
         fused_pointwise = np.hstack([
             (u_feats.detach().cpu().numpy() if hasattr(u_feats, 'detach') else u_feats),

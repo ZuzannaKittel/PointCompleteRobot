@@ -15,8 +15,28 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- I/O & METADATA ---
 def load_data(rgb_path, dep_path):
+    # Load RGB and Depth images, ensuring they are aligned in size.
     rgb = cv2.cvtColor(cv2.imread(rgb_path), cv2.COLOR_BGR2RGB)
-    depth = cv2.imread(dep_path, cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000.0
+
+    depth = cv2.imread(dep_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+
+    # Convert mm → meters ONLY if needed
+    if depth.dtype == np.uint16 or depth.max() > 100:
+        depth = depth / 1000.0
+
+    # =====================================================
+    # CANONICAL ALIGNMENT: DEPTH → RGB
+    # =====================================================
+    if rgb.shape[:2] != depth.shape[:2]:
+        depth = cv2.resize(
+            depth,
+            (rgb.shape[1], rgb.shape[0]),
+            interpolation=cv2.INTER_NEAREST
+        )
+
+    assert rgb.shape[:2] == depth.shape[:2], \
+    f"Mismatch RGB {rgb.shape} vs Depth {depth.shape}"
+
     return rgb, depth
 
 def load_metadata(json_path):
