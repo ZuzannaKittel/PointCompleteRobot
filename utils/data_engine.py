@@ -163,28 +163,10 @@ class SceneDataEngine:
         
         # 3. Completely normalize the CAD per-axis into a clean unit cube [-0.5, 0.5]^3
         gt_unit_cube = gt_centered / (cad_extents + 1e-8)
-        
-        # --- GLOBAL FIX: Universal +180-degree Y-axis rotation ---
-        # For theta = +180 degrees: cos(180) = -1, sin(180) = 0
-        # R_y = [[-1,  0,  0],
-        #        [ 0,  1,  0],
-        #        [ 0,  0, -1]]
-        R_y_180 = np.array([
-            [-1.0,  0.0,  0.0],
-            [ 0.0,  1.0,  0.0],
-            [ 0.0,  0.0, -1.0]
-        ], dtype=np.float64)
     
-        gt_unit_cube = gt_unit_cube @ R_y_180.T
         # --------------------------------------------------------
-        
-        # 4. Apply Anisotropic Scaling using real-world OBB proportions
-        real_extents = np.asarray(obb_data['axesLengths'], dtype=np.float64)  # Real object [L, W, H]
-        shared_max_size = np.max(real_extents)
-        
-        # Stretch/compress each axis to match the real-world aspect ratio inside canonical space
-        aspect_ratio_scale = real_extents / (shared_max_size + 1e-8)
-        gt_canonical = gt_unit_cube * aspect_ratio_scale * 0.9
+        # 4. Apply a uniform scaling factor to fit the CAD into a slightly smaller cube [-0.45, 0.45]^3
+        gt_canonical = gt_unit_cube * 0.9
 
         return gt_canonical
     
@@ -616,8 +598,8 @@ class SceneDataEngine:
         # ============================================================
         # 4. CANONICALIZATION (ALIGN TO ANNOTATED OBB FRAME)
         # ============================================================
-        # This properly centers and rotates the points using the GT anchor
-        local_pts = (pts_world_all - obb_center) @ obb_axes.T
+        # This properly centers the object in its canonical space, while preserving the relative orientation of the object to the camera.
+        local_pts = (pts_world_all - obb_center)
 
         # ============================================================
         # 5. FILTERING & SHARED NORMALIZATION
@@ -648,17 +630,20 @@ class SceneDataEngine:
         clean_pts_centered = np.asarray(pcd.points)[ind] # Already centered via OBB!
         debug_clean = clean_pts_centered.copy()
 
-        # C. Shared Normalization (Use OBB size, NOT partial scan size)
-        # extents is obb_data['axesLengths']
-        shared_max_size = np.max(extents) 
-        clean_pts_canonical = clean_pts_centered / (shared_max_size + 1e-8) * 0.9
+        # C. Normalization - use the same scale for both the CAD and the real-world scan to preserve relative orientation.
+        bbox_min = clean_pts_centered.min(axis=0)
+        bbox_max = clean_pts_centered.max(axis=0)
+
+        observed_extent = np.max(bbox_max - bbox_min)
+
+        clean_pts_canonical = clean_pts_centered / (observed_extent + 1e-8) * 0.9
         debug_canonical = clean_pts_canonical.copy()
 
         # ============================================================
         # 6. DINO FEATURES (project canonical points back into RGB frame).
         # ============================================================
         # Project canonical points back into aligned world space for pixel lookup.
-        clean_pts_world_actual = clean_pts_centered @ obb_axes + obb_center
+        clean_pts_world_actual = clean_pts_centered + obb_center
         clean_pts_world_actual = clean_pts_world_actual.astype(np.float64)
         
         w2c_best = np.linalg.inv(best_c2w)
