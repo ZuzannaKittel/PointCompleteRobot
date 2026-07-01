@@ -85,28 +85,6 @@ class SceneDataEngine:
 
         mask = inside | (soft < 0.15 * np.max(half_extents))
 
-        # Diagnostic counts for alternative local axis orientations.
-        """pts_local_A = (points - centroid) @ axes
-        pts_local_B = (points - centroid) @ axes.T
-        mask_A = np.all(np.abs(pts_local_A) <= (half_extents + 0.02), axis=1)
-        mask_B = np.all(np.abs(pts_local_B) <= (half_extents + 0.02), axis=1)
-        print("mask_A count:", mask_A.sum())
-        print("mask_B count:", mask_B.sum())"""
-
-        print("\nOBB DEBUG")
-        print("Half extents:", half_extents)
-        print("Local min:", pts_local.min(axis=0))
-        print("Local max:", pts_local.max(axis=0))
-
-        pts_local_A = (points - centroid) @ axes
-        pts_local_B = (points - centroid) @ axes.T
-
-        mask_A = np.all(np.abs(pts_local_A) <= half_extents, axis=1)
-        mask_B = np.all(np.abs(pts_local_B) <= half_extents, axis=1)
-
-        print("mask_A:", mask_A.sum())
-        print("mask_B:", mask_B.sum())
-
         return mask
 
     def _run_utonia_on_points(self, points, num_pts):
@@ -309,13 +287,6 @@ class SceneDataEngine:
 
         obb_axes = np.array(obb_data['normalizedAxes'], dtype=np.float64).reshape(3, 3)
         extents = np.array(obb_data['axesLengths'], dtype=np.float64)
-
-        # ============================
-        # TSDF ACCUMULATION GRID
-        # ============================
-        voxel_size = 0.02  # 2cm (tunable)
-        tsdf = {}  # sparse hash grid
-        tsdf_count = {}
 
         # ============================================================
         # 2. LOAD FRAMES AND PROJECT
@@ -530,6 +501,7 @@ class SceneDataEngine:
                     "mask": mask_2d.copy(),
                     "semantic_valid": semantic_valid.copy(),
                     "depth": depth.copy(),
+                    "rgb": rgb.copy(),
 
                     "K": K,
                     "c2w": c2w,
@@ -576,26 +548,70 @@ class SceneDataEngine:
             print(f"  {f['frame']}: {f['score']} points")
             print(f"Finished processing {frame_key}")
 
-        # Frame balancing
-        max_per_frame = 2000
+        ####################################################
+        # TSDF MULTI-VIEW FUSION
+        ####################################################
 
-        balanced = []
+        tsdf = o3d.pipelines.integration.ScalableTSDFVolume(
+
+            voxel_length=0.005,
+            sdf_trunc=0.03,
+
+            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+        )
 
         for item in selected_frames:
 
-            chunk = item["points"]
+            rgb = item["rgb"]
+            depth = item["depth"].copy()
+            mask = item["mask"]
 
-            if len(chunk) >= max_per_frame:
-                idx = np.random.choice(len(chunk), max_per_frame, replace=False)
-            else:
-                idx = np.random.choice(len(chunk), max_per_frame, replace=True)
+            depth[~mask] = 0
 
-            balanced.append(chunk[idx])
+            rgb_o3d = o3d.geometry.Image(rgb.astype(np.uint8))
+            depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
 
-        pts_world_all = np.concatenate(balanced, axis=0)
+            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
 
-        # Frames verification
-        pts_world_all = self.multiview_verify_points(pts_world_all, selected_frames)
+                rgb_o3d,
+                depth_o3d,
+
+                depth_scale=1.0,
+                depth_trunc=5.0,
+
+                convert_rgb_to_intensity=False,
+            )
+
+            K = item["K"]
+
+            intrinsic = o3d.camera.PinholeCameraIntrinsic(
+
+                width=rgb.shape[1],
+                height=rgb.shape[0],
+
+                fx=K["fx"],
+                fy=K["fy"],
+
+                cx=K["cx"],
+                cy=K["cy"]
+            )
+
+            tsdf.integrate(
+
+                rgbd,
+                intrinsic,
+                np.linalg.inv(item["c2w"])
+            )
+
+        mesh = tsdf.extract_triangle_mesh()
+
+        pcd = mesh.sample_points_uniformly(
+            number_of_points=12000
+        )
+
+        pts_world_all = np.asarray(pcd.points)
+
+        print("TSDF points:", len(pts_world_all))
 
         # ============================================================
         # 4. CANONICALIZATION (ALIGN TO ANNOTATED OBB FRAME)
