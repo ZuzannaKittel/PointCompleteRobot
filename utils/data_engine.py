@@ -1,6 +1,5 @@
 import os
 import json
-import pickle
 
 import cv2
 import numpy as np
@@ -8,7 +7,6 @@ import torch
 import trimesh
 import open3d as o3d
 from scipy.spatial import KDTree
-from typing import Tuple
 
 
 def _matrix_to_intrinsics(raw_k):
@@ -58,7 +56,6 @@ class SceneDataEngine:
     def __init__(self, paths, sam, dino, utonia):
         self.paths = paths
         self.sam = sam
-        print(f"DEBUG: Engine initialized. SAM type: {type(self.sam)}")
         self.dino = dino
         self.uto = utonia
         with open(paths["json"], "r") as f:
@@ -74,8 +71,6 @@ class SceneDataEngine:
         # Transform points from world space into the OBB local frame.
         pts_local = (points - centroid) @ axes.T
 
-        #mask = np.all(np.abs(pts_local) <= (half_extents + 0.05), axis=1)
-
         inside = np.all(np.abs(pts_local) <= half_extents, axis=1)
 
         soft = np.linalg.norm(
@@ -88,12 +83,19 @@ class SceneDataEngine:
         return mask
 
     def _run_utonia_on_points(self, points, num_pts):
-        pts_sampled = points.copy()
-        idx = np.random.choice(len(pts_sampled), num_pts, replace=(len(pts_sampled) < num_pts)).astype(np.int64)
-        pts_sampled = pts_sampled[idx]
+        pts = np.asarray(points, dtype=np.float32)
+        if pts.size == 0:
+            return pts, np.zeros((0, 32), dtype=np.float32), np.array([], dtype=np.int64)
 
-        # Sample or pad points to the requested Utonia input size.
-        u_input = torch.from_numpy(pts_sampled).float().unsqueeze(0).cuda()
+        num_pts = max(int(num_pts), 1)
+        if len(pts) <= num_pts:
+            idx = np.arange(len(pts), dtype=np.int64)
+        else:
+            idx = np.random.choice(len(pts), num_pts, replace=False).astype(np.int64)
+        pts_sampled = pts[idx]
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        u_input = torch.from_numpy(pts_sampled).float().unsqueeze(0).to(device)
         with torch.no_grad():
             outputs = self.uto(u_input)
 
@@ -108,37 +110,29 @@ class SceneDataEngine:
             sparse_coords = pts_sampled
             point_feats = outputs
 
-        # Infer the sparse coordinates and Utonia point features from the model output.
-
-        if hasattr(sparse_coords, 'detach'):
+        if hasattr(sparse_coords, "detach"):
             sparse_coords = sparse_coords.detach().cpu().numpy()
             if sparse_coords.shape[-1] == 4:
                 sparse_coords = sparse_coords[:, -3:]
-        if hasattr(point_feats, 'detach'):
+        if hasattr(point_feats, "detach"):
             point_feats = point_feats.detach().cpu().numpy()
 
-        print("\n================ UTONIA DEBUG ================")
-        print("pts_sampled shape:", pts_sampled.shape)
-        print("sparse_coords shape:", np.shape(sparse_coords))
-        print("point_feats shape:", np.shape(point_feats))
-
         if len(sparse_coords) < 4:
-            print("WARNING: sparse_coords too small, using identity fallback")
-            return pts_sampled, np.zeros((len(pts_sampled), 32)), idx
+            return pts_sampled, np.zeros((len(pts_sampled), 32), dtype=np.float32), idx
 
         tree = KDTree(sparse_coords)
-        distances, indices = tree.query(pts_sampled, k=4)
+        distances, indices = tree.query(pts_sampled, k=min(4, len(sparse_coords)))
         weights = 1.0 / (distances + 1e-8)
         weights /= np.sum(weights, axis=1, keepdims=True)
+        point_feats = np.asarray(point_feats)
+        if point_feats.ndim == 1:
+            point_feats = point_feats[:, None]
         aligned_point_feats = np.sum(point_feats[indices] * weights[:, :, None], axis=1)
 
         return pts_sampled, aligned_point_feats, idx
 
     def get_ground_truth(self, selected_box, shapenet_root, category, obb_data):
-        """
-        Load and anisotropically scale the ground truth CAD model 
-        to match the true aspect ratio of the real-world object.
-        """
+        """Load and rescale a CAD model into a canonical reference frame."""
         if selected_box is None or not hasattr(selected_box, 'catid_cad'):
             return None
 
@@ -174,8 +168,6 @@ class SceneDataEngine:
         return tuple(np.floor(p / voxel_size).astype(np.int32))
     
     def multiview_verify_points(self, points_world, selected_frames, depth_tol=0.03, confidence_thresh=0.5):
-        print("\nRunning global multi-view verification...")
-
         support = np.zeros(len(points_world), dtype=np.float32)
         visibility = np.zeros(len(points_world), dtype=np.float32)
 
@@ -216,46 +208,19 @@ class SceneDataEngine:
         
         confidence = support / np.maximum(visibility, 1)
 
-        print(
-            "Visibility:",
-            visibility.min(),
-            visibility.mean(),
-            visibility.max()
-        )
-
-        print(
-            "Support:",
-            support.min(),
-            support.mean(),
-            support.max()
-        )
-
-        print(
-            "Confidence:",
-            confidence.min(),
-            confidence.mean(),
-            confidence.max()
-        )
         keep = confidence >= confidence_thresh
         filtered = points_world[keep]
-        print("Verification kept", len(filtered), "/", len(points_world),"points")
-
         return filtered
 
     def get_multi_view_tsdf_object(self, frame_indices, obj_transform, obb_data, num_pts=2048):
-        # This is the main function that extracts the multi-view TSDF object point cloud, 
-        # applies SAM masking, canonicalizes it to the OBB frame, and fuses DINO + Utonia features.
-        
-        from utils.utils import load_data, get_frame_info, project_world_to_pixel, get_dino_features_bilinear
+        # This function extracts a multi-view TSDF object cloud, applies SAM masking,
+        # canonicalizes it to the OBB frame, and fuses DINO and Utonia features.
+        from utils.utils import load_data, project_world_to_pixel, get_dino_features_bilinear
 
-        # Extract the native 4x4 transform matrix and anchor translation.
         matrix_np = (obj_transform.detach().cpu().numpy() if hasattr(obj_transform, 'detach') else np.array(obj_transform)).astype(np.float64)
         T = matrix_np[3, :3]
 
         scene_root = os.path.dirname(self.paths["json"])
-
-        # Debug: only save the first processed object
-        debug_saved = False
 
         frame_clouds = []
         best_K, best_rgb, best_c2w = None, None, None
@@ -263,10 +228,6 @@ class SceneDataEngine:
         # 1. USE EVERYTHING IN ALIGNED SCANNET SPACE
         # ============================================================
         obb_center = np.array(obb_data['centroid'], dtype=np.float64)
-        # DEBUGGING: Print OBB and camera stats to verify they are in the expected range and location before projection.
-        """print("OBB center:", obb_center)
-        print("matrix translation:", matrix_np[3, :3])"""
-
         obb_axes = np.array(obb_data['normalizedAxes'], dtype=np.float64).reshape(3, 3)
         extents = np.array(obb_data['axesLengths'], dtype=np.float64)
 
@@ -275,7 +236,6 @@ class SceneDataEngine:
         # ============================================================
         for i, f_idx in enumerate(frame_indices):
             frame_key = f"frame_{f_idx:06d}"
-            print(f"\n==============================")
             print(f"Processing {frame_key}")
             rgb_path = os.path.join(scene_root, "rgb", f"{frame_key}.jpg")
             dep_path = os.path.join(scene_root, "depth", f"{frame_key}.png")
@@ -288,43 +248,29 @@ class SceneDataEngine:
 
             frame_entry = self.meta[frame_key]
 
-            # DEBUGGING: Print depth stats to verify the depth map is valid and in the expected range (e.g., 0.1m to 4.5m for indoor scenes).
-            # print("depth stats:", depth.min(), depth.max())
-            
             c2w = np.array(frame_entry.get('aligned_pose')).astype(np.float64)
             w2c = np.linalg.inv(c2w)
-
-            # DEBUGGING: Print camera and OBB stats to verify they are in the expected range and location.
-            """print("OBB centroid:", obb_center)
-            print("Camera position:", c2w[:3, 3])
-            print("Distance:", np.linalg.norm(obb_center - c2w[:3, 3]))"""
 
             # Extract camera intrinsics from the frame metadata.
             raw_k = frame_entry.get('intrinsics') or frame_entry.get('intrinsic')
             K = _matrix_to_intrinsics(raw_k)
 
-            if i == len(frame_indices) // 2:
+            if best_K is None:
                 best_K, best_rgb, best_c2w = K, rgb, c2w
 
             ## SAM MASKING: dynamic 2D bbox from projected OBB corners
             self.sam.set_image(rgb)
 
-            # 1. Calculate all 8 corners of the 3D OBB in world space.
-            h = extents * 0.5
+            # Compute the 8 corners of the 3D OBB in world space.
+            half_extents = extents * 0.5
             local_corners = np.array([
-                [x, y, z] for x in [-h[0], h[0]] for y in [-h[1], h[1]] for z in [-h[2], h[2]]
-            ])
+                [x, y, z] for x in [-half_extents[0], half_extents[0]]
+                for y in [-half_extents[1], half_extents[1]]
+                for z in [-half_extents[2], half_extents[2]]
+            ], dtype=np.float64)
 
-            #world_corners = obb_center + local_corners @ obb_axes
-
-            obb_axes = obb_axes / (np.linalg.norm(obb_axes, axis=0, keepdims=True) + 1e-8)
-
-            world_corners = np.zeros_like(local_corners)
-
-            for i in range(3):
-                world_corners += np.outer(local_corners[:, i], obb_axes[:, i])
-
-            world_corners = world_corners + obb_center
+            obb_axes = obb_axes / (np.linalg.norm(obb_axes, axis=1, keepdims=True) + 1e-8)
+            world_corners = local_corners @ obb_axes.T + obb_center
 
             # 2. Project all 8 corners into the 2D image plane
             pixels = []
@@ -336,19 +282,12 @@ class SceneDataEngine:
                     px = project_world_to_pixel(pt, w2c, K)
                     pixels.append(np.array(px).flatten())
 
-            # Edge case safety check
-            if len(pixels) < 4: 
-                continue  # Skip frame if the camera is inside/overwhelmingly behind the box
-            
-            # Now pixels will safely be shape (8, 2)
-            pixels = np.array(pixels)
+            if len(pixels) < 4:
+                continue
 
-            # Clamp using the high-res RGB frame boundaries where SAM runs
+            pixels = np.array(pixels, dtype=np.float32)
             img_h, img_w = rgb.shape[:2]
-            
-            # These slices will now safely grab the X column [:, 0] and Y column [:, 1]
-            # padding added to stablize sam bbox
-            pad = 0.1  # 10% padding
+            pad = 0.1
 
             x_min = np.min(pixels[:, 0])
             y_min = np.min(pixels[:, 1])
@@ -382,12 +321,10 @@ class SceneDataEngine:
                 continue
 
             print(
-                "Mask stats: \n",
-                frame_key,
-                "mask:", np.count_nonzero(mask_2d),
-                "depth valid:", np.count_nonzero(depth_valid),
-                "semantic:", np.count_nonzero(semantic_valid),
-            )   
+                f"  mask pixels: {np.count_nonzero(mask_2d)}, "
+                f"valid depth: {np.count_nonzero(depth_valid)}, "
+                f"semantic: {np.count_nonzero(semantic_valid)}"
+            )
 
             z_cam = depth[semantic_valid]
             if len(z_cam) == 0:
@@ -425,32 +362,14 @@ class SceneDataEngine:
                 continue
 
             pts_verified_frame = pts_cropped
-            support = np.ones(len(pts_verified_frame), dtype=np.float32)
-
-            # ============================================================
-            # SAFE OUTPUT (NO BROKEN INDEXING)
-            # ============================================================
-
-            support_mean = support.mean() if len(support) > 0 else 0.0
-
             keep_ratio = (
                 len(pts_verified_frame) / (len(pts_cropped) + 1e-8)
                 if len(pts_cropped) > 0 else 0.0
             )
 
             print(
-                frame_key,
-                "cropped:", len(pts_cropped),
-                "verified:", len(pts_verified_frame),
-                "keep ratio:", keep_ratio,
-                "support mean:", support_mean
-            )
-
-            print(
-                frame_key,
-                "mask pixels:", np.count_nonzero(mask_2d),
-                "valid depth:", np.count_nonzero(semantic_valid),
-                "cropped pts:", len(pts_cropped)
+                f"  frame {frame_key}: cropped={len(pts_cropped)}, "
+                f"verified={len(pts_verified_frame)}, keep_ratio={keep_ratio:.3f}"
             )
 
             # ============================================================
@@ -460,7 +379,6 @@ class SceneDataEngine:
             min_points = 80 # to keep small but valid frames
 
             if len(pts_verified_frame) < min_points:
-                print("   ⚠️ rejected frame:", len(pts_verified_frame))
                 continue
                             
             # Score based on the geometry richness and mask quality and consistency
@@ -471,7 +389,6 @@ class SceneDataEngine:
             score = coverage / (distance + 1e-6)
 
             if len(pts_cropped) > 10:
-                print(">>> Appending frame to frame_clouds")
                 frame_clouds.append({
                     "raw_points": pts_world.copy(),
                     "cropped_points": pts_cropped.copy(),
@@ -489,19 +406,13 @@ class SceneDataEngine:
                     "c2w": c2w,
                     "w2c": w2c,
                 })
-                print(">>> Frame appended")
 
-            print(frame_key, score)
-
-        print("\n==============================")
-        print("Finished processing ALL frames")
-        print("==============================")
+        print("Finished processing all frames")
 
         # ============================================================
         # 3. CHECK FUSION
         # ============================================================
         if len(frame_clouds) < 2:
-            print("⚠️ Not enough good views — skipping object")
             return None
 
         # ------------------------------------------------------------------
@@ -512,35 +423,15 @@ class SceneDataEngine:
         max_frames = 12
         selected_frames = frame_clouds[:max_frames]
 
-        if debug_saved is False:
-
-            debug_package = {
-                "selected_frames": selected_frames,
-                "obb_center": obb_center,
-                "obb_axes": obb_axes,
-                "extents": extents,
-            }
-
-            torch.save(debug_package, "debug_multiview.pt")
-
-            debug_saved = True
-
-        print("\nSelected frames:")
+        print("Selected frames:")
         for f in selected_frames:
-            print(f"  {f['frame']}: {f['score']} points")
-            print(f"Finished processing {frame_key}")
+            print(f"  {f['frame']}: score={f['score']:.3f}")
 
         ####################################################
         # TSDF MULTI-VIEW FUSION
         ####################################################
 
-        tsdf = o3d.pipelines.integration.ScalableTSDFVolume(
-
-            voxel_length=0.005,
-            sdf_trunc=0.03,
-
-            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
-        )
+        tsdf = o3d.pipelines.integration.ScalableTSDFVolume(voxel_length=0.005, sdf_trunc=0.03, color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
 
         for item in selected_frames:
 
@@ -553,43 +444,20 @@ class SceneDataEngine:
             rgb_o3d = o3d.geometry.Image(rgb.astype(np.uint8))
             depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
 
-            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-
-                rgb_o3d,
-                depth_o3d,
-
-                depth_scale=1.0,
-                depth_trunc=5.0,
-
-                convert_rgb_to_intensity=False,
-            )
+            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(rgb_o3d, depth_o3d, depth_scale=1.0, depth_trunc=5.0, convert_rgb_to_intensity=False)
 
             K = item["K"]
 
-            intrinsic = o3d.camera.PinholeCameraIntrinsic(
-
-                width=rgb.shape[1],
-                height=rgb.shape[0],
-
-                fx=K["fx"],
-                fy=K["fy"],
-
-                cx=K["cx"],
-                cy=K["cy"]
-            )
+            intrinsic = o3d.camera.PinholeCameraIntrinsic(width=rgb.shape[1], height=rgb.shape[0], fx=K["fx"], fy=K["fy"], cx=K["cx"], cy=K["cy"])
 
             tsdf.integrate(
-
                 rgbd,
                 intrinsic,
                 np.linalg.inv(item["c2w"])
             )
 
         mesh = tsdf.extract_triangle_mesh()
-
-        pcd = mesh.sample_points_uniformly(
-            number_of_points=12000
-        )
+        pcd = mesh.sample_points_uniformly(number_of_points=12000)
 
         pts_world_all = np.asarray(pcd.points)
 
@@ -604,16 +472,12 @@ class SceneDataEngine:
         # ============================================================
         # 5. FILTERING & SHARED NORMALIZATION
         # ============================================================
-        # A. Voxel Downsample
-        debug_local_pts = local_pts.copy()
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(local_pts)
 
         pcd = pcd.voxel_down_sample(voxel_size=0.005)
 
         final_pts_local = np.asarray(pcd.points)
-
-        debug_voxel = final_pts_local.copy()
 
         # light trimming only (outlier suppression, not shape destruction)
         centroid = final_pts_local.mean(axis=0)
@@ -623,21 +487,16 @@ class SceneDataEngine:
         threshold = np.percentile(dist, 99.5)
         final_pts_local = final_pts_local[dist < threshold]
 
-        # B. Statistical Outlier Removal (Cleans the floating noise)
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(final_pts_local)
-        cl, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-        clean_pts_centered = np.asarray(pcd.points)[ind] # Already centered via OBB!
-        debug_clean = clean_pts_centered.copy()
+        _, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        clean_pts_centered = final_pts_local[ind]
 
-        # C. Normalization - use the same scale for both the CAD and the real-world scan to preserve relative orientation.
         bbox_min = clean_pts_centered.min(axis=0)
         bbox_max = clean_pts_centered.max(axis=0)
 
         observed_extent = np.max(bbox_max - bbox_min)
-
         clean_pts_canonical = clean_pts_centered / (observed_extent + 1e-8) * 0.9
-        debug_canonical = clean_pts_canonical.copy()
 
         # ============================================================
         # 6. DINO FEATURES (project canonical points back into RGB frame).
@@ -655,17 +514,7 @@ class SceneDataEngine:
         # ============================================================
         # Extract Utonia point features on the canonical object shape.
         s_pts, u_feats, sampled_indices = self._run_utonia_on_points(clean_pts_canonical, num_pts)
-        debug_sampled = s_pts.copy()
         d_feats = d_feats[sampled_indices]
-
-        torch.save({
-            "merged": pts_world_all,
-            "local": debug_local_pts,
-            "voxel": debug_voxel,
-            "clean": debug_clean,
-            "canonical": debug_canonical,
-            "sampled": debug_sampled,
-        }, "debug_pipeline.pt")
 
         fused_pointwise = np.hstack([
             (u_feats.detach().cpu().numpy() if hasattr(u_feats, 'detach') else u_feats),
