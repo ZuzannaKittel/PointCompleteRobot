@@ -25,17 +25,22 @@ class ScanNetppImplicitDataset(Dataset):
         # Keep a clean record of the true world-space GT points for evaluation saving
         gt_pts_world = gt_pts.clone()
 
-        # 1. Coordinate Space Centering and Scaling (To Canonical Bounds)
-        centroid = gt_pts.mean(dim=0, keepdim=True)
+        # 1. Coordinate Space Normalization & Centering
+        centroid = partial_pts.mean(dim=0, keepdim=True)
         gt_pts = gt_pts - centroid
         partial_pts = partial_pts - centroid
 
         scale_factor = 1.0
-        max_dist = torch.max(torch.norm(gt_pts, dim=-1))
-        if max_dist > 0.4:
-            scale_factor = 0.4 / max_dist.item()
-            gt_pts *= scale_factor
-            partial_pts *= scale_factor
+        # Estimate scale from the observed partial geometry.
+        bbox = partial_pts.max(dim=0)[0] - partial_pts.min(dim=0)[0]
+        max_extent = bbox.max()
+
+        scale_factor = 1.0
+        if max_extent > 0.4:
+            scale_factor = 0.4 / max_extent.item()
+
+        gt_pts *= scale_factor
+        partial_pts *= scale_factor
 
         # 2. Slice/Pad point cloud sizes while maintaining strict feature alignment
         if partial_pts.shape[0] >= self.num_input_pts:

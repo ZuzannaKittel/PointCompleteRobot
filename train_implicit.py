@@ -72,6 +72,7 @@ if __name__ == "__main__":
     criterion = nn.BCEWithLogitsLoss()
 
     os.makedirs("runs/multimodal_baseline/snapshots", exist_ok=True)
+    os.makedirs("runs/multimodal_baseline/checkpoints", exist_ok=True)
     epochs = 75
 
     first_batch = next(iter(train_loader))
@@ -79,12 +80,12 @@ if __name__ == "__main__":
     print(first_batch['partial_feats'].shape)
 
     print("Feature dim:", detected_dim)
-    print("Encoder dim:", detected_dim + 3)
+    print("Encoder dim:", detected_dim)
 
     print("🔥 Starting training...")
 
     # --- TRAINING LOOP ---
-    train_model(encoder, decoder, train_loader, val_dataset, optimizer, criterion, device, epochs)
+    train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs)
 
     print("\n🏁 Framework routine finished. Run your evaluation snapshots through CloudCompare to see the improvements.")
 

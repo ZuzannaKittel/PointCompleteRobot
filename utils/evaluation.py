@@ -89,7 +89,7 @@ def save_test_sample(sample_idx, prefix,
 
         sample = test_dataset[sample_idx]
         feats = sample['partial_feats'].to(device)
-        recon_pts = extract_implicit_shape(encoder, decoder, feats, device, resolution=96, threshold=0.8)
+        recon_pts = extract_implicit_shape(encoder, decoder, feats, device, resolution=128, threshold=0.8)
         if len(recon_pts) == 0:
             print(f"Skipping {prefix}: empty reconstruction")
             return
@@ -144,6 +144,10 @@ def evaluate_test_set(encoder, decoder, test_dataset, device):
                 print(f"Processed {idx+1}/{len(test_dataset)}")
 
     results = sorted(results, key=lambda x: x["cd"])
+
+    if len(results) == 0:
+        print("No valid reconstructions found.")
+        return
 
     df = pd.DataFrame(results)
     df.to_csv("runs/test_results.csv", index=False)
