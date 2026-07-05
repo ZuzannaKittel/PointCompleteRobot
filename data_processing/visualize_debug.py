@@ -13,8 +13,7 @@ stages = [
     ("Voxel", data["voxel"]),
     ("Clean", data["clean"]),
     ("Canonical", data["canonical"]),
-    ("2048 Sampled", data["sampled"]),
-    ("GT", data["gt_pts"])
+    ("2048 Sampled", data["sampled"])
 ]
 
 fig = plt.figure(figsize=(18, 10))

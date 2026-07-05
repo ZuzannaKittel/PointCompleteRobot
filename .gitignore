@@ -9,6 +9,7 @@ checkpoints/
 *.pt
 *.ply
 *.jpg
+*.csv
 verify_frames/
 problem_example/
 visualizations/
