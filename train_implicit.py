@@ -6,6 +6,7 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader, random_split
 import trimesh
 import matplotlib.pyplot as plt
+import re
 
 from models.implicit_network import MultiModalFeatureEncoder, ImplicitDecoder
 
@@ -24,8 +25,8 @@ if __name__ == "__main__":
     
     data_files = glob.glob("data/geometric_pairs_dataset/train/*.pt")
     if not data_files:
-        raise FileNotFoundError("Missing data packages inside 'data/geometric_pairs_dataset/train/'")
-    print(f"📂 Discovered {len(data_files)} multi-modal data matrices.")
+        raise FileNotFoundError(f"Missing data packages inside {data_files}.")
+    print(f"📂 Discovered {len(data_files)} partial-complete training samples.")
 
     torch.manual_seed(42)
     train_size = int(0.8 * len(data_files))
@@ -71,6 +72,32 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(list(encoder.parameters()) + list(decoder.parameters()), lr=1e-3)
     criterion = nn.BCEWithLogitsLoss()
 
+    # ==========================================
+    # RESUME FROM LATEST CHECKPOINT (IF EXISTS)
+    # ==========================================
+    start_epoch = 0
+
+    checkpoint_dir = "runs/multimodal_baseline/checkpoints"
+    checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "epoch_*.pth"))
+
+    if checkpoint_files:
+        latest_checkpoint = max(
+            checkpoint_files,
+            key=lambda x: int(re.search(r"epoch_(\d+)", x).group(1))
+        )
+
+        print(f"📂 Loading checkpoint: {latest_checkpoint}")
+
+        checkpoint = torch.load(latest_checkpoint, map_location=device)
+
+        encoder.load_state_dict(checkpoint["encoder_state_dict"])
+        decoder.load_state_dict(checkpoint["decoder_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        start_epoch = checkpoint["epoch"]
+
+        print(f"✅ Resuming from epoch {start_epoch}")
+
     os.makedirs("runs/multimodal_baseline/snapshots", exist_ok=True)
     os.makedirs("runs/multimodal_baseline/checkpoints", exist_ok=True)
     epochs = 75
@@ -85,7 +112,7 @@ if __name__ == "__main__":
     print("🔥 Starting training...")
 
     # --- TRAINING LOOP ---
-    train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs)
+    train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs, start_epoch=start_epoch)
 
     print("\n🏁 Framework routine finished. Run your evaluation snapshots through CloudCompare to see the improvements.")
 

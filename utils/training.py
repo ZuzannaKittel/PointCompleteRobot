@@ -4,11 +4,11 @@ import torch
 
 from utils.evaluation import extract_implicit_shape
 
-def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs):
+def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs, start_epoch=0):
     # ------------------------------------------------
     # TRAINING LOOP
     # ------------------------------------------------
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         encoder.train()
         decoder.train()
         running_loss = 0.0
