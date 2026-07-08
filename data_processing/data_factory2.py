@@ -329,6 +329,7 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
             obj_id = getattr(obj, 'object_id', 'unknown')
             
             if not any(tc in raw_category for tc in target_categories): 
+                print(f"   ↳ ID {obj_id}: ⚠️ Skipped - Category '{raw_category}' not in target list.")
                 continue
 
             # --- 1. PRE-CALCULATE AND INITIALIZE ---
@@ -406,11 +407,43 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
 
 if __name__ == "__main__":
     CKPT_PATH = os.path.join(PROJECT_ROOT, "checkpoints/utoniadreamer/latest.pth")
-    TARGETS = ["desk", "chair", "table", "sofa", "furniture", "workstation", "bin"]
+    
+    # Categories of interest for the dataset generation. Modify this list to include/exclude specific object types.
+    TARGETS = [
+        "chair",
+        "table",
+        "sofa",
+        "desk",
+        "cabinet",
+        "bookshelf",
+        "shelf",
+        "bed",
+        "bench",
+        "lamp",
+        "light",
+        "bathtub",
+        "dishwasher",
+        "microwave",
+        "stove",
+        "washer",
+        "display",
+        "monitor",
+        "keyboard",
+        "laptop",
+        "printer",
+        "trash",
+        "bin",
+        "basket",
+        "file cabinet",
+        "pillow",
+        "mug",
+        "bowl",
+        "clock"
+    ]
     
     generate_universal_dataset(
         base_data_dir="data/ScanNetpp", 
-        output_dir="data/geometric_pairs_dataset", 
+        output_dir="data/geometric_pairs_dataset2", 
         target_categories=TARGETS,
         checkpoint_path=CKPT_PATH
     )
