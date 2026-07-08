@@ -23,7 +23,7 @@ if __name__ == "__main__":
     print("🚀 Initializing Multi-Modal Multi-Class Pipeline...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    data_files = glob.glob("data/geometric_pairs_dataset/train/*.pt")
+    data_files = glob.glob("data/geometric_pairs_dataset2/train/*.pt")
     if not data_files:
         raise FileNotFoundError(f"Missing data packages inside {data_files}.")
     print(f"📂 Discovered {len(data_files)} partial-complete training samples.")
@@ -77,7 +77,7 @@ if __name__ == "__main__":
     # ==========================================
     start_epoch = 0
 
-    checkpoint_dir = "runs/multimodal_baseline/checkpoints"
+    checkpoint_dir = "runs/multimodal_doublelatent/checkpoints"
     checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "epoch_*.pth"))
 
     if checkpoint_files:
@@ -98,9 +98,9 @@ if __name__ == "__main__":
 
         print(f"✅ Resuming from epoch {start_epoch}")
 
-    os.makedirs("runs/multimodal_baseline/snapshots", exist_ok=True)
-    os.makedirs("runs/multimodal_baseline/checkpoints", exist_ok=True)
-    epochs = 75
+    os.makedirs("runs/multimodal_doublelatent/snapshots", exist_ok=True)
+    os.makedirs("runs/multimodal_doublelatent/checkpoints", exist_ok=True)
+    epochs = 50
 
     first_batch = next(iter(train_loader))
 

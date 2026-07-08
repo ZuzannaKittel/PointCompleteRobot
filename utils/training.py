@@ -66,7 +66,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
         # --------------------------------------------------
         if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
             # Save checkpoint
-            ckpt_path = (f"runs/multimodal_baseline/checkpoints/"f"epoch_{epoch+1:02d}.pth")
+            ckpt_path = (f"runs/multimodal_doublelatent/checkpoints/"f"epoch_{epoch+1:02d}.pth")
             torch.save({
                 "epoch": epoch + 1,
                 "encoder_state_dict": encoder.state_dict(),
@@ -85,7 +85,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
                 # Extract implicit shape from the model
                 recon_pts = extract_implicit_shape(encoder, decoder, v_feats, device, resolution=64, threshold=0.8)
 
-                base_snap_path = (f"runs/multimodal_baseline/snapshots/"f"epoch_{epoch+1:02d}_obj{sample_idx}")
+                base_snap_path = (f"runs/multimodal_doublelatent/snapshots/"f"epoch_{epoch+1:02d}_obj{sample_idx}")
                 
                 # Save ground truth and partial point clouds for comparison
                 gt_pts_world = val_sample['gt_pts_world'].numpy()
