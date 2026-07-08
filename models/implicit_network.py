@@ -50,42 +50,42 @@ class MultiModalFeatureEncoder(nn.Module):
 
 
 class ImplicitDecoder(nn.Module):
-    """
-    Decodes a continuous coordinate space conditioned on a multi-modal global latent shape vector.
-    """
     def __init__(self, latent_dim=1024, hidden_dim=256):
         super().__init__()
+
         self.coord_encoder = nn.Sequential(
             nn.Linear(3, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU()
         )
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim + latent_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1)
-        )
+
+        # FIRST FUSION
+        self.fc1 = nn.Linear(hidden_dim + latent_dim, hidden_dim)
+
+        # SECOND FUSION (IMPORTANT CHANGE)
+        self.fc2 = nn.Linear(hidden_dim + latent_dim, hidden_dim)
+
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, 1)
 
     def forward(self, query_pts, latent_vector):
-        """
-        Args:
-            query_pts: [B, Q, 3] continuous coordinate values to evaluate
-            latent_vector: [B, latent_dim] global shape embedding
-        Returns:
-            logits: [B, Q] continuous implicit occupancy logs
-        """
         B, Q, _ = query_pts.shape
-        
-        # Encode implicit spatial query locations
-        coord_feats = self.coord_encoder(query_pts) # [B, Q, hidden_dim]
-        
-        # Broadcast the global descriptor to align with individual queries
-        latent_expanded = latent_vector.unsqueeze(1).expand(-1, Q, -1) # [B, Q, latent_dim]
-        
-        # Concatenate features and query continuous scalar fields
-        combined = torch.cat([coord_feats, latent_expanded], dim=-1)
-        logits = self.decoder(combined)
+
+        coord_feats = self.coord_encoder(query_pts)
+
+        latent = latent_vector.unsqueeze(1).expand(-1, Q, -1)
+
+        # ---- FIRST FUSION ----
+        x = torch.cat([coord_feats, latent], dim=-1)
+        x = torch.nn.functional.gelu(self.fc1(x))
+
+        # ---- SECOND FUSION (KEY IMPROVEMENT) ----
+        x = torch.cat([x, latent], dim=-1)
+        x = torch.nn.functional.gelu(self.fc2(x))
+
+        # ---- FINAL MLP ----
+        x = torch.nn.functional.gelu(self.fc3(x))
+        logits = self.fc_out(x)
+
         return logits.squeeze(-1)
