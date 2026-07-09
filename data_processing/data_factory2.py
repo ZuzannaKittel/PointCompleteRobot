@@ -244,29 +244,29 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
         os.path.join(absolute_output_dir, "pair_*.pt")
     )
 
+    # --- Track unique object pairs instead of scenes ---
+    existing_files = glob.glob(os.path.join(absolute_output_dir, "pair_*.pt"))
     existing_ids = []
-    processed_scenes = set()
+    processed_pairs = set()  # Tracks (scene_id, obj_id)
 
     for f in existing_files:
         try:
             name = os.path.basename(f)
-
-            # pair_01309_c0c863b72d_chair_1.pt
-            tokens = name[:-3].split("_")
+            tokens = name[:-3].split("_")  # Strip '.pt' and split
 
             pair_id = int(tokens[1])
             scene_id = tokens[2]
+            obj_id = tokens[-1]  # Safely grabs the last item (the number)
 
             existing_ids.append(pair_id)
-            processed_scenes.add(scene_id)
+            processed_pairs.add((scene_id, obj_id))
 
-        except Exception:
-            print(f"⚠️ Could not parse {f}")
+        except Exception as e:
+            print(f"⚠️ Could not parse filename {f}: {e}")
 
     pair_counter = max(existing_ids) + 1 if existing_ids else 0
-
-    print(f"Starting pair_counter at {pair_counter}")
-    print(f"Found {len(processed_scenes)} completed scenes.")
+    print(f"🚀 Found {len(processed_pairs)} completed object pairs on disk.")
+    print(f"📈 Next pair will start with index: {pair_counter}")
 
     print("🤖 Initializing Foundation Backbones...")
     dino = init_dino()
@@ -282,9 +282,11 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
 
         scene_id = os.path.basename(scene_path)
 
-        if scene_id in processed_scenes:
+        # Do not skip full scenes anymore; process all scenes regardless of previous runs 
+        # and rely on the processed_pairs set to skip individual objects instead.
+        """if scene_id in processed_scenes:
             print(f"⏭️ Scene {scene_id} already processed. Skipping.")
-            continue
+            continue"""
 
         # This skips the ghost folders (which does not contain "iphone" folder) 
         # instantly before printing any debug statements
@@ -326,10 +328,15 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
 
         for obj in annotation_obj.obj_annotation_list:
             raw_category = str(getattr(obj, 'category_label', getattr(obj, 'scannet_category_label', ''))).lower()
-            obj_id = getattr(obj, 'object_id', 'unknown')
-            
-            if not any(tc in raw_category for tc in target_categories): 
-                print(f"   ↳ ID {obj_id}: ⚠️ Skipped - Category '{raw_category}' not in target list.")
+            obj_id = str(getattr(obj, 'object_id', 'unknown'))
+
+            # --- Skip this specific object if already processed ---
+            if (scene_id, obj_id) in processed_pairs:
+                print(f"   ⏭️ Skipping object ID {obj_id} ({raw_category}) in scene {scene_id}: already processed.")
+                continue  # Silently bypasses heavy extraction for existing targets
+
+            # The loop continues down to your target category check next...
+            if not any(tc in raw_category for tc in target_categories):
                 continue
 
             # --- 1. PRE-CALCULATE AND INITIALIZE ---
@@ -413,32 +420,39 @@ if __name__ == "__main__":
         "chair",
         "table",
         "sofa",
-        "desk",
         "cabinet",
         "bookshelf",
         "shelf",
         "bed",
         "bench",
-        "lamp",
-        "light",
+        "file cabinet",
         "bathtub",
         "dishwasher",
         "microwave",
         "stove",
         "washer",
+        "faucet",
         "display",
         "monitor",
         "keyboard",
         "laptop",
         "printer",
+        "cellphone",
+        "loudspeaker",
+        "speaker",
         "trash",
         "bin",
         "basket",
-        "file cabinet",
         "pillow",
         "mug",
         "bowl",
-        "clock"
+        "bottle",
+        "pot",
+        "bag",
+        "clock",
+        "piano",
+        "guitar",
+        "lamp"
     ]
     
     generate_universal_dataset(
