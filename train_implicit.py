@@ -8,19 +8,24 @@ import trimesh
 import matplotlib.pyplot as plt
 import re
 
-from models.implicit_network import MultiModalFeatureEncoder, ImplicitDecoder
+from models.implicit_network import MultiModalFeatureEncoder, ImplicitDecoderDoubleLatent, ImplicitDecoderBasic
 
+from configs.run_config import get_run_name, get_run_dir
 from utils.training import train_model
 
 from utils.implicit_dataset import ScanNetppImplicitDataset
 
 from utils.evaluation import evaluate_test_set
 
+RUN_NAME = get_run_name()
+RUN_DIR = get_run_dir()
+
+
 # ==========================================
 # ENGINE RUNTIME PIPELINE
 # ==========================================
 if __name__ == "__main__":
-    print("🚀 Initializing Multi-Modal Multi-Class Pipeline...")
+    print(f"🚀 Initializing experiment: {RUN_NAME}...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     data_files = glob.glob("data/geometric_pairs_dataset2/train/*.pt")
@@ -64,10 +69,19 @@ if __name__ == "__main__":
         latent_dim=512
     ).to(device)
     
-    decoder = ImplicitDecoder(
+    decoder = ImplicitDecoderDoubleLatent(
         latent_dim=1024,
         hidden_dim=256
     ).to(device)
+
+    # Calculate total number of parameters in the model
+    num_params = (
+        sum(p.numel() for p in encoder.parameters())
+        +
+        sum(p.numel() for p in decoder.parameters())
+    )
+
+    print(f"Total parameters: {num_params:,}")
     
     optimizer = torch.optim.AdamW(list(encoder.parameters()) + list(decoder.parameters()), lr=1e-3)
     criterion = nn.BCEWithLogitsLoss()
@@ -77,7 +91,7 @@ if __name__ == "__main__":
     # ==========================================
     start_epoch = 0
 
-    checkpoint_dir = "runs/multimodal_doublelatent/checkpoints"
+    checkpoint_dir = f"{RUN_DIR}/checkpoints"
     checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "epoch_*.pth"))
 
     if checkpoint_files:
@@ -92,15 +106,32 @@ if __name__ == "__main__":
 
         encoder.load_state_dict(checkpoint["encoder_state_dict"])
         decoder.load_state_dict(checkpoint["decoder_state_dict"])
+
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
         start_epoch = checkpoint["epoch"]
 
         print(f"✅ Resuming from epoch {start_epoch}")
 
-    os.makedirs("runs/multimodal_doublelatent/snapshots", exist_ok=True)
-    os.makedirs("runs/multimodal_doublelatent/checkpoints", exist_ok=True)
-    epochs = 50
+    os.makedirs(f"{RUN_DIR}/snapshots", exist_ok=True)
+    os.makedirs(f"{RUN_DIR}/checkpoints", exist_ok=True)
+
+    epochs = 150
+    
+    # ==========================================
+    # TRAINING CONFIGURATION
+    # ==========================================
+    with open(f"{RUN_DIR}/model_summary.txt","w") as f:
+
+        f.write(f"Feature dimension: {detected_dim}\n")
+        f.write("Encoder latent: 512\n")
+        f.write("Decoder latent: 1024\n")
+        f.write("Hidden dim: 256\n")
+        f.write("Batch size: 32\n")
+        f.write(f"Epochs: {epochs}\n")
+        f.write("Optimizer: AdamW\n")
+        f.write("Learning rate: 1e-3\n")
+        f.write(f"Parameters: {num_params}\n")
 
     first_batch = next(iter(train_loader))
 
@@ -112,9 +143,9 @@ if __name__ == "__main__":
     print("🔥 Starting training...")
 
     # --- TRAINING LOOP ---
-    train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs, start_epoch=start_epoch)
+    train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs, start_epoch=start_epoch, RUN_NAME=RUN_NAME, RUN_DIR=RUN_DIR)
 
     print("\n🏁 Framework routine finished. Run your evaluation snapshots through CloudCompare to see the improvements.")
 
     # --- FINAL TEST SET EVALUATION ---
-    evaluate_test_set(encoder, decoder, test_dataset, device)
+    evaluate_test_set(encoder, decoder, test_dataset, device, RUN_DIR=RUN_DIR)

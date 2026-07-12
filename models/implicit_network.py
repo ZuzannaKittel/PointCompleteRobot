@@ -49,7 +49,12 @@ class MultiModalFeatureEncoder(nn.Module):
         return global_latent
 
 
-class ImplicitDecoder(nn.Module):
+class ImplicitDecoderDoubleLatent(nn.Module):
+    """
+    Decodes a continuous coordinate space conditioned on a multi-modal global latent shape vector.
+    This version incorporates a second fusion step to enhance the interaction between the latent vector and the coordinate
+    features, which can improve the model's ability to capture complex shape details.
+    """
     def __init__(self, latent_dim=1024, hidden_dim=256):
         super().__init__()
 
@@ -89,3 +94,34 @@ class ImplicitDecoder(nn.Module):
         logits = self.fc_out(x)
 
         return logits.squeeze(-1)
+    
+
+class ImplicitDecoderBasic(nn.Module):
+    """
+    Decodes a continuous coordinate space conditioned on a multi-modal global latent shape vector.
+    This is a simpler version of the decoder that uses a single fusion step between the coordinate features and the latent vector.
+    """
+    def __init__(self, latent_dim=1024, hidden_dim=256):
+        super().__init__()
+        self.coord_encoder = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU()
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim + latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, query_pts, latent_vector):
+        coord_feats = self.coord_encoder(query_pts) # [B, Q, hidden_dim]
+
+        # Broadcast the global descriptor to align with individual queries
+        latent_expanded = latent_vector.unsqueeze(1).expand(-1, Q, -1) # [B, Q, latent_dim]
+
+        # Concatenate features and query continuous scalar fields
+        combined = torch.cat([coord_feats, latent_expanded], dim=-1)
