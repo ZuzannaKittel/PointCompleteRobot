@@ -7,7 +7,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from configs.run_config import get_run_name, get_run_dir
+from configs.run_config import RUN_DIR, get_run_decoder, get_run_model, get_run_name, get_run_dir
 from utils.evaluation import extract_implicit_shape
 
 def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs, start_epoch=0, RUN_NAME=None, RUN_DIR=None):
@@ -24,16 +24,40 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
     train_losses = []
     val_losses = []
     epoch_times = []
+    learning_rates = []
 
+    # Load the best validation loss from the checkpoint if resuming training
     best_val_loss = float("inf")
 
+    patience = 10
+    epochs_without_improvement = 0
+
+    checkpoint_path = f"{RUN_DIR}/checkpoints/best_model.pth"
+
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        best_val_loss = checkpoint["val_loss"]
+
+        print(
+            f"📂 Found previous best model "
+            f"(best validation loss = {best_val_loss:.6f})"
+        )
+
+    # Create the LR scheduler ONCE
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=5,
+    )
+
     config = {
-            "input_features":"fusion",
-            "decoder":"double_latent",
+            "input_features":get_run_model(),
+            "decoder":get_run_decoder(),
             "epochs":epochs,
             "batch_size":32,
-            "learning_rate":1e-3,
-            "latent_dim":1024,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "latent_dim":512,
             "hidden_dim":256,
             "threshold":0.8,
             "resolution_eval":128
@@ -60,12 +84,27 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
             q_coords = batch['query_coords'].to(device) # Continuous query coordinates for occupancy evaluation 
             targets = batch['target_occupancy'].to(device) # Binary occupancy labels for each query coordinate
 
+            # Print the positive occupancy ratio for the first batch of the first epoch to monitor class imbalance
+            if epoch == 0 and running_loss == 0:
+                print(
+                    f"Positive occupancy ratio: "
+                    f"{targets.float().mean().item():.4f}"
+                )
+
             latents = encoder(p_feats)
 
             pred_logits = decoder(q_coords, latents)
             
             loss = criterion(pred_logits, targets)
             loss.backward()
+
+            # Gradient clipping to prevent exploding gradients and stabilize training
+            torch.nn.utils.clip_grad_norm_(
+                list(encoder.parameters()) +
+                list(decoder.parameters()),
+                max_norm=1.0
+            )
+
             optimizer.step()
             
             running_loss += loss.item()
@@ -94,6 +133,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
                 val_loss += loss.item()
 
         val_loss /= len(val_loader)
+        scheduler.step(val_loss)
 
         # Track the best validation loss and save the corresponding model checkpoint
         train_losses.append(epoch_loss)
@@ -102,15 +142,22 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
         epoch_time = time.time() - epoch_start
         epoch_times.append(epoch_time)
 
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        learning_rates.append(current_lr)
+
         print(
             f"📈 [Epoch {epoch+1:02d}/{epochs}] "
             f"Train: {epoch_loss:.6f} | "
-            f"Val: {val_loss:.6f}"
+            f"Val: {val_loss:.6f} | "
+            f"LR: {current_lr:.2e}"
         )
 
         # Save the best model based on validation loss
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+
+            epochs_without_improvement = 0
 
             torch.save({
                 "epoch": epoch + 1,
@@ -122,6 +169,9 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
             f"{RUN_DIR}/checkpoints/best_model.pth")
 
             print("⭐ New best model saved.")
+        else:
+            epochs_without_improvement += 1
+            print(f"⏳ No improvement for {epochs_without_improvement} epoch(s).")
 
         # --------------------------------------------------
         # CHECKPOINT + VISUALIZATION
@@ -145,7 +195,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
                 v_feats = val_sample['partial_feats'].to(device)
 
                 # Extract implicit shape from the model
-                recon_pts, inference_time = extract_implicit_shape(encoder, decoder, v_feats, device, resolution=64, threshold=0.8)
+                recon_pts, inference_time = extract_implicit_shape(encoder, decoder, v_feats, device, resolution=128, threshold=0.8)
 
                 base_snap_path = (f"{RUN_DIR}/snapshots/"f"epoch_{epoch+1:02d}_obj{sample_idx}")
                 
@@ -168,6 +218,10 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
 
                     print(f"   📸 Saved sample {sample_idx} "f"for epoch {epoch+1:02d}")
 
+        if epochs_without_improvement >= patience:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+
     # --------------------------------------------------
     # Save training history to CSV for later analysis   
     # --------------------------------------------------
@@ -175,6 +229,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
         "epoch": np.arange(1, len(train_losses)+1),
         "train_loss": train_losses,
         "val_loss": val_losses,
+        "learning_rate": learning_rates,
         "epoch_time_sec": epoch_times
     })
 

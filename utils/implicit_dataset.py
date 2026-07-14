@@ -62,14 +62,14 @@ class ScanNetppImplicitDataset(Dataset):
         
         rand_idx = torch.randint(0, gt_pts.shape[0], (num_boundary,))
         chosen_gt = gt_pts[rand_idx, :]
-        q_boundary = chosen_gt + torch.randn(num_boundary, 3) * 0.015
+        q_boundary = chosen_gt + torch.randn(num_boundary, 3) * 0.025
 
         query_coords = torch.cat([q_uniform, q_boundary], dim=0)
 
         # 4. Target Occupancy Evaluation
         dists = torch.cdist(query_coords.unsqueeze(0), gt_pts.unsqueeze(0))
         min_dists, _ = torch.min(dists, dim=-1)
-        target_occupancy = (min_dists < 0.025).float().squeeze(0)
+        target_occupancy = (min_dists < 0.015).float().squeeze(0)
 
         return {
             'partial_feats': partial_feats_fixed,

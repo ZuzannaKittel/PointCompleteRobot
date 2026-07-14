@@ -74,12 +74,12 @@ def extract_implicit_shape(encoder, decoder, partial_feats, device, resolution=6
         probabilities = torch.sigmoid(total_logits).squeeze(0)
 
         # Compute quantiles for occupancy probabilities
-        print(
+        """print(
             f"Occupancy stats | "
             f"min={probabilities.min():.6f} "
             f"mean={probabilities.mean():.6f} "
             f"max={probabilities.max():.6f}"
-        )
+        )"""
 
         """ # Determine the occupancy threshold for reconstruction
         thresholds = [0.5, 0.6, 0.7, 0.8]
@@ -102,7 +102,7 @@ def extract_implicit_shape(encoder, decoder, partial_feats, device, resolution=6
     #decoder.train()
 
     # Print the number of reconstructed points for debugging
-    print(f"Reconstructed points: " f"{len(reconstructed_points)}")
+    #print(f"Reconstructed points: " f"{len(reconstructed_points)}")
 
     elapsed = time.time() - start
 

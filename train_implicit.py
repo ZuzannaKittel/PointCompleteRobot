@@ -66,12 +66,12 @@ if __name__ == "__main__":
 
     encoder = MultiModalFeatureEncoder(
         input_feat_dim=detected_dim,
-        latent_dim=512
+        latent_dim=256
     ).to(device)
     
-    decoder = ImplicitDecoderDoubleLatent(
-        latent_dim=1024,
-        hidden_dim=256
+    decoder = ImplicitDecoderBasic(
+        latent_dim=512,
+        hidden_dim=256  
     ).to(device)
 
     # Calculate total number of parameters in the model
@@ -83,7 +83,12 @@ if __name__ == "__main__":
 
     print(f"Total parameters: {num_params:,}")
     
-    optimizer = torch.optim.AdamW(list(encoder.parameters()) + list(decoder.parameters()), lr=1e-3)
+    optimizer = torch.optim.AdamW(
+        list(encoder.parameters()) +
+        list(decoder.parameters()),
+        lr=5e-4,
+        weight_decay=1e-4,
+    )
     criterion = nn.BCEWithLogitsLoss()
 
     # ==========================================
@@ -124,13 +129,13 @@ if __name__ == "__main__":
     with open(f"{RUN_DIR}/model_summary.txt","w") as f:
 
         f.write(f"Feature dimension: {detected_dim}\n")
-        f.write("Encoder latent: 512\n")
-        f.write("Decoder latent: 1024\n")
-        f.write("Hidden dim: 256\n")
+        f.write("Encoder latent: 256\n")
+        f.write("Decoder latent: 512\n")
+        f.write("Hidden dim: 192\n")
         f.write("Batch size: 32\n")
         f.write(f"Epochs: {epochs}\n")
         f.write("Optimizer: AdamW\n")
-        f.write("Learning rate: 1e-3\n")
+        f.write("Learning rate: 5e-4\n")
         f.write(f"Parameters: {num_params}\n")
 
     first_batch = next(iter(train_loader))
