@@ -57,4 +57,4 @@ def visualize_saved_pair_truthful(pt_file_path):
     plt.show()
 
 # Usage
-visualize_saved_pair_truthful("./data/geometric_pairs_dataset/train/pair_00092_94ee15e8ba_table_18.pt")
+visualize_saved_pair_truthful("./data/geometric_pairs_dataset2/train/pair_00049_355e5e32db_sofa_28.pt")

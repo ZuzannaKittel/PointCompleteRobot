@@ -8,7 +8,7 @@ import trimesh
 import matplotlib.pyplot as plt
 import re
 
-from models.implicit_network import MultiModalFeatureEncoder, ImplicitDecoderDoubleLatent, ImplicitDecoderBasic
+from models.implicit_network import MultiModalFeatureEncoder, ImplicitDecoderBasic
 
 from configs.run_config import get_run_name, get_run_dir
 from utils.training import train_model
@@ -28,7 +28,7 @@ if __name__ == "__main__":
     print(f"🚀 Initializing experiment: {RUN_NAME}...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    data_files = glob.glob("data/geometric_pairs_dataset2/train/*.pt")
+    data_files = glob.glob("data/pairs_shapenet/train/*.pt")
     if not data_files:
         raise FileNotFoundError(f"Missing data packages inside {data_files}.")
     print(f"📂 Discovered {len(data_files)} partial-complete training samples.")
@@ -64,14 +64,16 @@ if __name__ == "__main__":
     detected_dim = sample_data['partial_feats'].shape[-1]
     print(f"🧬 Automatically detected feature dimension from factory output: {detected_dim}")
 
+    # ShapeNet pretraining uses 1024-dim features, while ScanNetpp uses 1408-dim features. 
+    # Adjust the encoder input dimension accordingly.
     encoder = MultiModalFeatureEncoder(
-        input_feat_dim=detected_dim,
-        latent_dim=256
+        input_feat_dim=1024,
+        latent_dim=512
     ).to(device)
-    
+
     decoder = ImplicitDecoderBasic(
-        latent_dim=512,
-        hidden_dim=256  
+        latent_dim=1024,
+        hidden_dim=256
     ).to(device)
 
     # Calculate total number of parameters in the model
@@ -126,17 +128,19 @@ if __name__ == "__main__":
     # ==========================================
     # TRAINING CONFIGURATION
     # ==========================================
-    with open(f"{RUN_DIR}/model_summary.txt","w") as f:
+    with open(f"{RUN_DIR}/model_summary.txt", "w") as f:
 
-        f.write(f"Feature dimension: {detected_dim}\n")
-        f.write("Encoder latent: 256\n")
-        f.write("Decoder latent: 512\n")
-        f.write("Hidden dim: 192\n")
+        f.write(f"Input feature dimension: {detected_dim}\n")
+        f.write("Input projection: input_dim -> 1024\n")
+        f.write("Encoder latent: 512\n")
+        f.write("Global latent (max+mean): 1024\n")
+        f.write("Decoder latent: 1024\n")
+        f.write("Hidden dim: 256\n")
         f.write("Batch size: 32\n")
         f.write(f"Epochs: {epochs}\n")
         f.write("Optimizer: AdamW\n")
         f.write("Learning rate: 5e-4\n")
-        f.write(f"Parameters: {num_params}\n")
+        f.write(f"Parameters: {num_params:,}\n")
 
     first_batch = next(iter(train_loader))
 

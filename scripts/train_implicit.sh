@@ -3,12 +3,12 @@
 #SBATCH --output=../logs/%j.out
 #SBATCH --error=../logs/%j.err
 
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
-#SBATCH --qos=normal  
+#SBATCH --partition=l40s
+#SBATCH --gres=gpu:l40s:1
+#SBATCH --qos=besteffort
 
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=48G
 
 #SBATCH --time=04:00:00
 

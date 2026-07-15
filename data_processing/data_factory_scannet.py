@@ -25,7 +25,7 @@ if PROJECT_ROOT not in sys.path:
 from models.models import init_dino, init_sam, init_utonia
 
 import utils
-from utils.data_engine import SceneDataEngine
+from data_processing.data_engine_scannet import SceneDataEngine
 
 # 3. Dynamic Safety Patch: Force any sub-module matrix extractions to Float64
 if hasattr(utils, 'get_frame_info'):
@@ -393,9 +393,11 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
 
             # Complete package saved as a single .pt file for easy loading in training scripts
             data_pair = {
+                "dataset": "ScanNetpp",
                 "scene_id": scene_id,
                 "object_id": obj_id,
                 "category": raw_category,
+                "feature_dim": fused_pointwise.shape[-1],
                 "partial_pts": torch.from_numpy(s_pts).half(), # Save space by using half precision for the raw points
                 "partial_feats": torch.from_numpy(fused_pointwise).half(), # Save space by using half precision for the raw features
                 "gt_pts": torch.from_numpy(gt_points).half(), # Save space by using half precision for the GT points
@@ -457,7 +459,7 @@ if __name__ == "__main__":
     
     generate_universal_dataset(
         base_data_dir="data/ScanNetpp", 
-        output_dir="data/geometric_pairs_dataset2", 
+        output_dir="data/pairs_scannet", 
         target_categories=TARGETS,
         checkpoint_path=CKPT_PATH
     )

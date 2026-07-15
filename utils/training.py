@@ -52,15 +52,16 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
     )
 
     config = {
-            "input_features":get_run_model(),
-            "decoder":get_run_decoder(),
-            "epochs":epochs,
-            "batch_size":32,
+            "input_features": get_run_model(),
+            "encoder_latent_dim": 512,
+            "global_latent_dim": 1024,
+            "decoder": get_run_decoder(),
+            "epochs": epochs,
+            "batch_size": 32,
             "learning_rate": optimizer.param_groups[0]["lr"],
-            "latent_dim":512,
-            "hidden_dim":256,
-            "threshold":0.8,
-            "resolution_eval":128
+            "hidden_dim": 256,
+            "threshold": 0.8,
+            "resolution_eval": 128,
         }
 
     pd.DataFrame([config]).to_csv(
@@ -189,7 +190,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
             print(f"💾 Checkpoint saved: {ckpt_path}")
 
             # Visualize reconstruction for a few samples from the validation set
-            tracked_indices = [0, 1, 2]
+            tracked_indices = [0, 10, 20]
             for sample_idx in tracked_indices:
                 val_sample = val_dataset[sample_idx]
                 v_feats = val_sample['partial_feats'].to(device)
