@@ -1,21 +1,19 @@
-import os
 import glob
-import torch
-import torch.nn as nn
-import numpy as np
-from torch.utils.data import Dataset, DataLoader, random_split
-import trimesh
-import matplotlib.pyplot as plt
+import os
 import re
 
-from models.implicit_network import MultiModalFeatureEncoder, ImplicitDecoderBasic
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+import trimesh
+from torch.utils.data import DataLoader, Dataset, random_split
 
-from configs.run_config import get_run_name, get_run_dir
-from utils.training import train_model
-
-from utils.implicit_dataset import ScanNetppImplicitDataset
-
+from configs.run_config import get_run_dir, get_run_name
+from models.implicit_network import ImplicitDecoderBasic, MultiModalFeatureEncoder
 from utils.evaluation import evaluate_test_set
+from utils.implicit_dataset import ScanNetppImplicitDataset
+from utils.training import train_model
 
 RUN_NAME = get_run_name()
 RUN_DIR = get_run_dir()
@@ -27,12 +25,48 @@ RUN_DIR = get_run_dir()
 if __name__ == "__main__":
     print(f"🚀 Initializing experiment: {RUN_NAME}...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    data_files = glob.glob("data/pairs_shapenet/train/*.pt")
+
+    # ==========================================================
+    # TRAINING MODE
+    # ==========================================================
+
+    MODE = "scannet_finetune"
+    # MODE = "shapenet_pretrain"
+    # MODE = "shapenet_resume"
+
+    if MODE == "shapenet_pretrain":
+        DATA_DIR = "data/pairs_shapenet/train/*.pt"
+        INPUT_DIM = 1024
+        LR = 5e-4
+        LOAD_MODEL = None
+        WD = 1e-4
+        RUN_NAME = "shapenet_pretraining"
+    elif MODE == "shapenet_resume":
+        DATA_DIR = "data/pairs_shapenet/train/*.pt"
+        INPUT_DIM = 1024
+        LR = 5e-4
+        LOAD_MODEL = "latest"
+        WD = 1e-4
+        RUN_NAME = "shapenet_pretraining"
+    elif MODE == "scannet_finetune":
+        DATA_DIR = "data/geometric_pairs_dataset2/train/*.pt"
+        INPUT_DIM = 1408
+        LR = 1e-4
+        WD = 5e-5
+        RUN_NAME = "scannet_finetuning"
+        LOAD_MODEL = "runs/shapenet_pretraining/checkpoints/best_model.pth"
+
+    RUN_DIR = os.path.join("runs", RUN_NAME)
+
+    print(f"Training mode : {MODE}")
+    print(f"Dataset       : {DATA_DIR}")
+    print(f"Learning rate : {LR}")
+    print(f"Input dim     : {INPUT_DIM}")
+
+    data_files = glob.glob(DATA_DIR)
     if not data_files:
         raise FileNotFoundError(f"Missing data packages inside {data_files}.")
     print(f"📂 Discovered {len(data_files)} partial-complete training samples.")
-
     torch.manual_seed(42)
     train_size = int(0.8 * len(data_files))
     val_size = int(0.1 * len(data_files))
@@ -58,17 +92,19 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 
-    #print(f"📊 Training Sets: {len(train_dataset)} shapes | Validation Sets: {len(val_dataset)} shapes")
-
-    sample_data = torch.load(data_files[6], weights_only=False)
+    sample_data = torch.load(data_files[0], map_location="cpu", weights_only=False)
     detected_dim = sample_data['partial_feats'].shape[-1]
     print(f"🧬 Automatically detected feature dimension from factory output: {detected_dim}")
 
-    # ShapeNet pretraining uses 1024-dim features, while ScanNetpp uses 1408-dim features. 
-    # Adjust the encoder input dimension accordingly.
+    # Assert that the detected feature dimension matches the expected input dimension
+    assert detected_dim == INPUT_DIM, (
+        f"Dataset features ({detected_dim}) "
+        f"do not match encoder input ({INPUT_DIM})"
+    )
+
     encoder = MultiModalFeatureEncoder(
-        input_feat_dim=1024,
-        latent_dim=512
+        input_feat_dim=INPUT_DIM,
+        latent_dim=512,
     ).to(device)
 
     decoder = ImplicitDecoderBasic(
@@ -84,12 +120,12 @@ if __name__ == "__main__":
     )
 
     print(f"Total parameters: {num_params:,}")
-    
+
     optimizer = torch.optim.AdamW(
         list(encoder.parameters()) +
         list(decoder.parameters()),
-        lr=5e-4,
-        weight_decay=1e-4,
+        lr=LR,
+        weight_decay=WD,
     )
     criterion = nn.BCEWithLogitsLoss()
 
@@ -98,38 +134,104 @@ if __name__ == "__main__":
     # ==========================================
     start_epoch = 0
 
-    checkpoint_dir = f"{RUN_DIR}/checkpoints"
-    checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "epoch_*.pth"))
+    if LOAD_MODEL is not None:
 
-    if checkpoint_files:
-        latest_checkpoint = max(
-            checkpoint_files,
-            key=lambda x: int(re.search(r"epoch_(\d+)", x).group(1))
+        if LOAD_MODEL == "latest":
+
+            checkpoint_dir = f"{RUN_DIR}/checkpoints"
+
+            checkpoint_files = glob.glob(
+                os.path.join(checkpoint_dir, "epoch_*.pth")
+            )
+
+            if checkpoint_files:
+
+                LOAD_MODEL = max(
+                    checkpoint_files,
+                    key=lambda x: int(
+                        re.search(r"epoch_(\d+)", x).group(1)
+                    )
+                )
+
+        print(f"\nLoading weights from:\n{LOAD_MODEL}")
+
+        checkpoint = torch.load(
+            LOAD_MODEL,
+            map_location=device,
         )
 
-        print(f"📂 Loading checkpoint: {latest_checkpoint}")
+        state = checkpoint["encoder_state_dict"]
 
-        checkpoint = torch.load(latest_checkpoint, map_location=device)
+        # Rename ShapeNet projection to the new Utonia branch
+        renamed_state = {}
 
-        encoder.load_state_dict(checkpoint["encoder_state_dict"])
-        decoder.load_state_dict(checkpoint["decoder_state_dict"])
+        for k, v in state.items():
+            if k.startswith("input_projection"):
+                new_key = k.replace("input_projection", "utonia_projection")
+            else:
+                new_key = k
 
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            renamed_state[new_key] = v
 
-        start_epoch = checkpoint["epoch"]
+        state = renamed_state
 
-        print(f"✅ Resuming from epoch {start_epoch}")
+        current = encoder.state_dict()
+
+        compatible = {}
+
+        loaded = []
+        skipped = []
+
+        for k, v in state.items():
+            if k in current and current[k].shape == v.shape:
+                compatible[k] = v
+                loaded.append(k)
+            else:
+                skipped.append(k)
+
+        print("\nLoaded:")
+        for k in loaded:
+            print("  ", k)
+
+        print("\nSkipped:")
+        for k in skipped:
+            print("  ", k)
+
+        current.update(compatible)
+
+        encoder.load_state_dict(current)
+
+        # Verify how many weighttensors were loaded successfully
+        loaded = len(compatible)
+        total = len(current)
+
+        print(f"Loaded {loaded}/{total} encoder tensors")
+
+        decoder.load_state_dict(
+            checkpoint["decoder_state_dict"]
+        )
+
+        # only resume optimizer if continuing SAME experiment
+        if MODE == "shapenet_resume":
+
+            optimizer.load_state_dict(
+                checkpoint["optimizer_state_dict"]
+            )
+
+            start_epoch = checkpoint["epoch"]
 
     os.makedirs(f"{RUN_DIR}/snapshots", exist_ok=True)
     os.makedirs(f"{RUN_DIR}/checkpoints", exist_ok=True)
 
-    epochs = 150
+    if MODE == "scannet_finetune":
+        epochs = 60
+    else:
+        epochs = 100
     
     # ==========================================
     # TRAINING CONFIGURATION
     # ==========================================
     with open(f"{RUN_DIR}/model_summary.txt", "w") as f:
-
         f.write(f"Input feature dimension: {detected_dim}\n")
         f.write("Input projection: input_dim -> 1024\n")
         f.write("Encoder latent: 512\n")
@@ -139,7 +241,7 @@ if __name__ == "__main__":
         f.write("Batch size: 32\n")
         f.write(f"Epochs: {epochs}\n")
         f.write("Optimizer: AdamW\n")
-        f.write("Learning rate: 5e-4\n")
+        f.write(f"Learning rate: {LR}\n")
         f.write(f"Parameters: {num_params:,}\n")
 
     first_batch = next(iter(train_loader))
@@ -147,12 +249,25 @@ if __name__ == "__main__":
     print(first_batch['partial_feats'].shape)
 
     print("Feature dim:", detected_dim)
-    print("Encoder dim:", detected_dim)
+    print("Encoder input:", INPUT_DIM)
 
     print("🔥 Starting training...")
 
-    # --- TRAINING LOOP ---
-    train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs, start_epoch=start_epoch, RUN_NAME=RUN_NAME, RUN_DIR=RUN_DIR)
+    train_model(
+        encoder,
+        decoder,
+        train_loader,
+        val_loader,
+        val_dataset,
+        optimizer,
+        criterion,
+        device,
+        epochs,
+        start_epoch=start_epoch,
+        RUN_NAME=RUN_NAME,
+        RUN_DIR=RUN_DIR,
+        resume_training=(MODE == "shapenet_resume"),
+    )
 
     print("\n🏁 Framework routine finished. Run your evaluation snapshots through CloudCompare to see the improvements.")
 

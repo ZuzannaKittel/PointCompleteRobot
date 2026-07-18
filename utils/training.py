@@ -10,7 +10,8 @@ from pathlib import Path
 from configs.run_config import RUN_DIR, get_run_decoder, get_run_model, get_run_name, get_run_dir
 from utils.evaluation import extract_implicit_shape
 
-def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs, start_epoch=0, RUN_NAME=None, RUN_DIR=None):
+
+def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs, start_epoch=0, RUN_NAME=None, RUN_DIR=None, resume_training=False):
     if RUN_NAME is None:
         RUN_NAME = get_run_name()
     if RUN_DIR is None:
@@ -26,29 +27,34 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
     epoch_times = []
     learning_rates = []
 
-    # Load the best validation loss from the checkpoint if resuming training
+    patience = 15  # Number of epochs to wait for improvement before early stopping
+
     best_val_loss = float("inf")
 
-    patience = 10
-    epochs_without_improvement = 0
+    if resume_training:
 
-    checkpoint_path = f"{RUN_DIR}/checkpoints/best_model.pth"
+        checkpoint_path = f"{RUN_DIR}/checkpoints/best_model.pth"
 
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        best_val_loss = checkpoint["val_loss"]
+        if os.path.exists(checkpoint_path):
 
-        print(
-            f"📂 Found previous best model "
-            f"(best validation loss = {best_val_loss:.6f})"
-        )
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location=device,
+            )
+
+            best_val_loss = checkpoint["val_loss"]
+
+            print(
+                f"📂 Found previous best model "
+                f"(best validation loss = {best_val_loss:.6f})"
+            )
 
     # Create the LR scheduler ONCE
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
         factor=0.5,
-        patience=5,
+        patience=10,
     )
 
     config = {
@@ -62,6 +68,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
             "hidden_dim": 256,
             "threshold": 0.8,
             "resolution_eval": 128,
+            "weight_decay": optimizer.param_groups[0]["weight_decay"]
         }
 
     pd.DataFrame([config]).to_csv(

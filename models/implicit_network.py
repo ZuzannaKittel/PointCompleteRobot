@@ -22,11 +22,28 @@ class MultiModalFeatureEncoder(nn.Module):
         self.input_feat_dim = input_feat_dim
         self.latent_dim = latent_dim
 
-        self.input_projection = nn.Sequential(
-            nn.Linear(input_feat_dim, 1024),
-            nn.GELU(),
-            nn.Dropout(0.15),
-        )
+        if input_feat_dim == 1024:
+            # ShapeNet pretraining
+            self.utonia_projection = nn.Sequential(
+                nn.Linear(1024, 1024),
+                nn.GELU(),
+                nn.Dropout(0.15),
+            )
+            self.dino_projection = None
+
+        elif input_feat_dim == 1408:
+            # ScanNet++ finetuning
+            self.utonia_projection = nn.Sequential(
+                nn.Linear(1024, 1024),
+                nn.GELU(),
+                nn.Dropout(0.15),
+            )
+
+            self.dino_projection = nn.Sequential(
+                nn.Linear(384, 1024),
+                nn.GELU(),
+                nn.Dropout(0.15),
+            )
 
         self.encoder = nn.Sequential(
             nn.Linear(1024, latent_dim),
@@ -39,7 +56,20 @@ class MultiModalFeatureEncoder(nn.Module):
     def forward(self, partial_feats):
 
         # [B,N,input_dim]
-        x = self.input_projection(partial_feats)
+        if self.input_feat_dim == 1024:
+
+            x = self.utonia_projection(partial_feats)
+
+        else:
+
+            utonia = partial_feats[..., :1024]
+            dino = partial_feats[..., 1024:]
+
+            x = (
+                self.utonia_projection(utonia)
+                +
+                self.dino_projection(dino)
+            )
 
         # [B,N,512]
         x = self.encoder(x)
