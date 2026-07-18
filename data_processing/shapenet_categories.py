@@ -44,5 +44,6 @@ SHAPENET_CATEGORIES = {
     "trash": "02747177",
     "bin": "02747177",
     "file cabinet": "03337140",
+    "pot": "03991062",
 
 }

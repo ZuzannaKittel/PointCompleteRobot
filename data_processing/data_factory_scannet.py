@@ -17,6 +17,7 @@ import open3d as o3d
 import torch
 import numpy as np
 from tqdm import tqdm
+import traceback
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -373,7 +374,7 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
 
             # --- 3. EXECUTION ---
             try:
-                s_pts, u_feats, d_feats, fused_pointwise, _ = engine.get_multi_view_tsdf_object(
+                s_pts, u_feats, d_feats, fused_pointwise = engine.get_multi_view_tsdf_object(
                     sweep_frames, 
                     T_obj, 
                     obb_data, 
@@ -381,7 +382,8 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
                 )
                 print(f"   ☑️ Partial point cloud extracted with {s_pts.shape[0]} points.")
             except Exception as e:
-                print(f"   ❌ Extraction failed for ID {obj_id} at {world_center}: {e}")
+                print(f"❌ Extraction failed for ID {obj_id}")
+                #traceback.print_exc()
                 continue
 
             # Harvest Ground Truth

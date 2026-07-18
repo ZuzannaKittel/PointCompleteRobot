@@ -140,27 +140,27 @@ class SceneDataEngine:
         if not os.path.exists(cad_path):
             return None
 
-        # Load and sample surface points
         mesh = trimesh.load(cad_path, force='mesh')
+
+        vertices = np.asarray(mesh.vertices)
+
+        # Compute the axis-aligned bounding box of the CAD model
+        gt_min = vertices.min(axis=0)
+        gt_max = vertices.max(axis=0)
+
         gt_pts = mesh.sample(16384)
 
-        # 1. Calculate the current tight bounds of the raw CAD points
-        gt_min = gt_pts.min(axis=0)
-        gt_max = gt_pts.max(axis=0)
+        # 1. Center the CAD points at the origin
         gt_center = (gt_max + gt_min) / 2.0
         
-        # Center the CAD points at the origin
+        # 2. Center the CAD points at the origin
         gt_centered = gt_pts - gt_center
         
-        # 2. Determine the unique extent lengths of this specific CAD asset
-        cad_extents = gt_max - gt_min  # Shape: (3,) -> [length, width, height]
-        
-        # 3. Completely normalize the CAD per-axis into a clean unit cube [-0.5, 0.5]^3
-        gt_unit_cube = gt_centered / (cad_extents + 1e-8)
+        # 3. Determine the largest extent of the CAD model to normalize it into a unit cube
+        extent = np.max(gt_max - gt_min)
     
-        # --------------------------------------------------------
-        # 4. Apply a uniform scaling factor to fit the CAD into a slightly smaller cube [-0.45, 0.45]^3
-        gt_canonical = gt_unit_cube * 0.9
+        # 4. Apply a uniform scaling factor to fit the CAD into a canonical space, leaving a small margin (0.9) to avoid touching the boundaries
+        gt_canonical = gt_centered / (extent + 1e-8) * 0.9
 
         return gt_canonical
     
@@ -216,9 +216,6 @@ class SceneDataEngine:
         # This function extracts a multi-view TSDF object cloud, applies SAM masking,
         # canonicalizes it to the OBB frame, and fuses DINO and Utonia features.
         from utils.utils import load_data, project_world_to_pixel, get_dino_features_bilinear
-
-        matrix_np = (obj_transform.detach().cpu().numpy() if hasattr(obj_transform, 'detach') else np.array(obj_transform)).astype(np.float64)
-        T = matrix_np[3, :3]
 
         scene_root = os.path.dirname(self.paths["json"])
 
@@ -457,17 +454,50 @@ class SceneDataEngine:
             )
 
         mesh = tsdf.extract_triangle_mesh()
+
+        # Guard against empty meshes after TSDF fusion
+        if len(mesh.vertices) == 0:
+            print("⚠️ Empty TSDF mesh")
+            return None
+        
         pcd = mesh.sample_points_uniformly(number_of_points=12000)
 
         pts_world_all = np.asarray(pcd.points)
 
+        # Guard against empty or too small point clouds after TSDF fusion
+        if len(pts_world_all) < 500:
+            return None
+
         print("TSDF points:", len(pts_world_all))
 
+        # Crop with OBB again to remove any stray points outside the object
+        mask = self.get_obb_mask(pts_world_all, obb_data)
+        pts_world_all = pts_world_all[mask]
+
+        # Guard against empty or too small point clouds after OBB cropping
+        if len(pts_world_all) < 500:
+            return None
+
+        print("After final OBB crop:", len(pts_world_all))
+
+        print(f"Points after final OBB crop: {len(pts_world_all)}, Mean mask value: {np.mean(mask)}")
+
         # ============================================================
-        # 4. CANONICALIZATION (ALIGN TO ANNOTATED OBB FRAME)
+        # 4. CANONICALIZATION FROM OBSERVED GEOMETRY ONLY
         # ============================================================
-        # This properly centers the object in its canonical space, while preserving the relative orientation of the object to the camera.
-        local_pts = (pts_world_all - obb_center)
+        # Translation is removed by centering the reconstructed object.
+        # Rotation is preserved in the ScanNet world frame.
+        # No ground-truth pose or object orientation is used.
+
+        world_centroid = pts_world_all.mean(axis=0)
+
+        local_pts = pts_world_all - world_centroid
+
+        print("Observed extents:", np.ptp(local_pts, axis=0))
+
+        bbox = np.ptp(local_pts, axis=0)
+
+        print("Extent after OBB rotation:", bbox)
 
         # ============================================================
         # 5. FILTERING & SHARED NORMALIZATION
@@ -480,8 +510,8 @@ class SceneDataEngine:
         final_pts_local = np.asarray(pcd.points)
 
         # light trimming only (outlier suppression, not shape destruction)
-        centroid = final_pts_local.mean(axis=0)
-        dist = np.linalg.norm(final_pts_local - centroid, axis=1)
+        final_centroid = final_pts_local.mean(axis=0)
+        dist = np.linalg.norm(final_pts_local - final_centroid, axis=1)
 
         # only remove extreme outliers (very safe)
         threshold = np.percentile(dist, 99.5)
@@ -492,18 +522,29 @@ class SceneDataEngine:
         _, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
         clean_pts_centered = final_pts_local[ind]
 
+        # Guard against empty or too small point clouds after filtering
+        if len(clean_pts_centered) < 500:
+            return None
+
+        clean_pts_centered -= clean_pts_centered.mean(axis=0)
+
         bbox_min = clean_pts_centered.min(axis=0)
         bbox_max = clean_pts_centered.max(axis=0)
 
         observed_extent = np.max(bbox_max - bbox_min)
+        
+        # Guard against degenerate cases where the observed extent is too small
+        if observed_extent < 1e-6:
+            print("⚠️ Degenerate reconstruction")
+            return None
+
         clean_pts_canonical = clean_pts_centered / (observed_extent + 1e-8) * 0.9
 
         # ============================================================
         # 6. DINO FEATURES (project canonical points back into RGB frame).
         # ============================================================
         # Project canonical points back into aligned world space for pixel lookup.
-        clean_pts_world_actual = clean_pts_centered + obb_center
-        clean_pts_world_actual = clean_pts_world_actual.astype(np.float64)
+        clean_pts_world_actual = clean_pts_centered + world_centroid
         
         w2c_best = np.linalg.inv(best_c2w)
         uv_continuous = project_world_to_pixel(clean_pts_world_actual, w2c_best, best_K)
@@ -524,4 +565,4 @@ class SceneDataEngine:
         print("FINAL CLOUD SIZE:", len(clean_pts_centered))
         print("FINAL CANONICAL SIZE:", len(clean_pts_canonical))
 
-        return s_pts, u_feats, d_feats, fused_pointwise, T
+        return s_pts, u_feats, d_feats, fused_pointwise
