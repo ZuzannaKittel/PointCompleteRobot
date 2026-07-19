@@ -1,7 +1,6 @@
 import os
 
 import numpy as np
-import open3d as o3d
 import torch
 import trimesh
 from scipy.spatial import KDTree
@@ -11,32 +10,12 @@ class ShapeNetDataEngine:
     def __init__(self, utonia):
         self.uto = utonia
 
-    # Canonicalization of points to fit within a unit cube centered at the origin
-    def canonicalize_points(self, points, center, extents):
-        points = points - center
-        points = points / (extents + 1e-8)
-        points = points * 0.9
-        return points.astype(np.float32)
-
-    # ShapeNet Ground Truth Loader
-    def load_gt_points(self, mesh_path, num_points=16384):
+    # ShapeNet Ground Truth and Mesh Loader
+    # No normalization since ShapeNet_preprocessed is already canonical
+    def load_mesh_and_gt(self, mesh_path, num_points=16384):
         mesh = trimesh.load(mesh_path, force="mesh")
-
-        pts = mesh.sample(num_points)
-
-        p_min = pts.min(axis=0)
-        p_max = pts.max(axis=0)
-
-        center = (p_min + p_max) / 2
-        extents = p_max - p_min
-
-        pts = self.canonicalize_points(
-            pts,
-            center,
-            extents
-        )
-
-        return pts, center, extents
+        gt = mesh.sample(num_points).astype(np.float32)
+        return mesh, gt
     
     # Camera generation
     def create_camera_pose(self, radius=2.0):
@@ -99,7 +78,7 @@ class ShapeNetDataEngine:
         else:
             partial = np.concatenate(partial_views, axis=0)
 
-        return partial
+        return partial.astype(np.float32)
 
     ############################################################
     # Utonia
@@ -164,9 +143,7 @@ class ShapeNetDataEngine:
     # Main generation
     ############################################################
     def generate_pair(self, mesh_path):
-        gt, center, extents = self.load_gt_points(mesh_path)
-
-        mesh = trimesh.load(mesh_path, force="mesh")
+        mesh, gt = self.load_mesh_and_gt(mesh_path)
 
         # Generate partial
         partial = self.generate_partial_cloud(mesh)
@@ -178,19 +155,12 @@ class ShapeNetDataEngine:
 
         # Add Gaussian noise to the partial point cloud
         noise_sigma = np.random.uniform(0.001, 0.003)
-        partial += np.random.normal(0, noise_sigma, partial.shape)
+        partial += np.random.normal(0, noise_sigma, partial.shape).astype(np.float32)
         
         # Ensure the partial point cloud has at least 2048 points
         if len(partial) < 2048:
             ids = np.random.choice(len(partial), 2048, replace=True)
             partial = partial[ids]
-
-        # Canonicalize the partial point cloud
-        partial = self.canonicalize_points(
-            partial,
-            center,
-            extents
-        )
 
         print(f"Partial size before Utonia: {len(partial)}")
 

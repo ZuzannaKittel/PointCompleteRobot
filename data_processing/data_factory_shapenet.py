@@ -1,3 +1,5 @@
+print(">>> data_factory_shapenet.py started", flush=True)
+
 import os
 import glob
 import sys
