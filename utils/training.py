@@ -6,6 +6,7 @@ import time
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
+from models.dinocomplete import DinoCompleteBaselineEncoder
 
 from configs.run_config import RUN_DIR, get_run_decoder, get_run_model, get_run_name, get_run_dir
 from utils.evaluation import extract_implicit_shape
@@ -43,6 +44,9 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
             )
 
             best_val_loss = checkpoint["val_loss"]
+
+            # Restore epochs_without_improvement
+            epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
 
             print(
                 f"📂 Found previous best model "
@@ -89,6 +93,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
             optimizer.zero_grad()
             
             p_feats = batch['partial_feats'].to(device) # Multi-modal features (e.g., fused Utonia + DINOv2) for each point 
+            p_pts = batch["partial_pts"].to(device) # Geometric points
             q_coords = batch['query_coords'].to(device) # Continuous query coordinates for occupancy evaluation 
             targets = batch['target_occupancy'].to(device) # Binary occupancy labels for each query coordinate
 
@@ -98,8 +103,12 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
                     f"Positive occupancy ratio: "
                     f"{targets.float().mean().item():.4f}"
                 )
-
-            latents = encoder(p_feats)
+            
+            # Depends on the architecture
+            if isinstance(encoder, DinoCompleteBaselineEncoder):
+                latents = encoder(p_pts, p_feats)
+            else:
+                latents = encoder(p_feats)
 
             pred_logits = decoder(q_coords, latents)
             
@@ -128,12 +137,17 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
 
         with torch.no_grad():
             for batch in val_loader:
-
+                
+                p_pts = batch["partial_pts"].to(device)
                 p_feats = batch['partial_feats'].to(device)
                 q_coords = batch['query_coords'].to(device)
                 targets = batch['target_occupancy'].to(device)
 
-                latents = encoder(p_feats)
+                # Depends on the architecture
+                if isinstance(encoder, DinoCompleteBaselineEncoder):
+                    latents = encoder(p_pts, p_feats)
+                else:
+                    latents = encoder(p_feats)
 
                 pred_logits = decoder(q_coords, latents)
 
@@ -173,6 +187,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
                 "decoder_state_dict": decoder.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": val_loss,
+                "epochs_without_improvement": epochs_without_improvement,
             },
             f"{RUN_DIR}/checkpoints/best_model.pth")
 
@@ -193,6 +208,8 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
                 "decoder_state_dict": decoder.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": epoch_loss,
+                "val_loss": val_loss,
+                "epochs_without_improvement": epochs_without_improvement,
             }, ckpt_path)
             print(f"💾 Checkpoint saved: {ckpt_path}")
 
@@ -200,10 +217,11 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
             tracked_indices = [0, 10, 20]
             for sample_idx in tracked_indices:
                 val_sample = val_dataset[sample_idx]
+                v_pts = val_sample["partial_pts"].to(device)
                 v_feats = val_sample['partial_feats'].to(device)
 
                 # Extract implicit shape from the model
-                recon_pts, inference_time = extract_implicit_shape(encoder, decoder, v_feats, device, resolution=128, threshold=0.8)
+                recon_pts, inference_time = extract_implicit_shape(encoder, decoder, v_pts, v_feats, device, resolution=128, threshold=0.8)
 
                 base_snap_path = (f"{RUN_DIR}/snapshots/"f"epoch_{epoch+1:02d}_obj{sample_idx}")
                 

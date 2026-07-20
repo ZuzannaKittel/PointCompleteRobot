@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 from configs.run_config import get_run_dir, get_run_name
 from models.implicit_network import ImplicitDecoderBasic, MultiModalFeatureEncoder
+from models.dinocomplete import DinoCompleteBaselineEncoder
 from utils.evaluation import evaluate_test_set
 from utils.implicit_dataset import ScanNetppImplicitDataset
 from utils.training import train_model
@@ -29,23 +30,28 @@ if __name__ == "__main__":
     # ==========================================================
     # TRAINING MODE
     # ==========================================================
+    
+    # TODO: Select the ARCHITECTURE
+    ARCHITECTURE = "ours"
+    # ARCHITECTURE = "dinocomplete"
 
-    MODE = "scannet_finetune"
+    # TODO: Select the MODE
+    MODE = "shapenet_resume"
     # MODE = "shapenet_pretrain"
     # MODE = "shapenet_resume"
 
     if MODE == "shapenet_pretrain":
         DATA_DIR = "data/pairs_shapenet/train/*.pt"
-        INPUT_DIM = 1024
+        INPUT_DIM = 1024 if ARCHITECTURE == "ours" else 1408
         LR = 5e-4
         LOAD_MODEL = None
         WD = 1e-4
         RUN_NAME = "shapenet_pretraining"
     elif MODE == "shapenet_resume":
         DATA_DIR = "data/pairs_shapenet/train/*.pt"
-        INPUT_DIM = 1024
+        INPUT_DIM = 1024 if ARCHITECTURE == "ours" else 1408
         LR = 5e-4
-        LOAD_MODEL = "latest"
+        LOAD_MODEL = "best"
         WD = 1e-4
         RUN_NAME = "shapenet_pretraining"
     elif MODE == "scannet_finetune":
@@ -54,11 +60,59 @@ if __name__ == "__main__":
         LR = 1e-4
         WD = 5e-5
         RUN_NAME = "scannet_finetuning"
-        LOAD_MODEL = "runs/shapenet_pretraining/checkpoints/best_model.pth"
+        LOAD_MODEL = "best"
+
+    if ARCHITECTURE == "ours":
+        RUN_NAME += "_ours"
+    else:
+        RUN_NAME += "_dinocomplete"
 
     RUN_DIR = os.path.join("runs", RUN_NAME)
 
+    # -------------------------------------------------------
+    # Determine which checkpoint (if any) should be loaded.
+    #
+    # shapenet_pretrain  -> start from scratch
+    # shapenet_resume    -> resume this exact run if available
+    # scannet_finetune   -> initialize from ShapeNet pretraining if available
+    # -------------------------------------------------------
+
+    if MODE == "shapenet_pretrain":
+        LOAD_MODEL = None
+
+    elif MODE == "shapenet_resume":
+        resume_ckpt = os.path.join(RUN_DIR, "checkpoints", "best_model.pth")
+        LOAD_MODEL = resume_ckpt if os.path.exists(resume_ckpt) else None
+
+        if LOAD_MODEL is None:
+            raise FileNotFoundError("Resume requested but no checkpoint was found.")
+
+    elif MODE == "scannet_finetune":
+        PRETRAIN_RUN = (
+            "shapenet_pretraining_ours"
+            if ARCHITECTURE == "ours"
+            else "shapenet_pretraining_dinocomplete"
+        )
+
+        pretrain_ckpt = os.path.join(
+            "runs",
+            PRETRAIN_RUN,
+            "checkpoints",
+            "best_model.pth",
+        )
+
+        if os.path.exists(pretrain_ckpt):
+            LOAD_MODEL = pretrain_ckpt
+        else:
+            LOAD_MODEL = None
+            print(
+                f"Pretraining checkpoint not found: {pretrain_ckpt}\n"
+                "Training will start from scratch."
+            )
+
     print(f"Training mode : {MODE}")
+    print(f"Architecture  : {ARCHITECTURE}")
+    print(f"Checkpoint    : {LOAD_MODEL}")
     print(f"Dataset       : {DATA_DIR}")
     print(f"Learning rate : {LR}")
     print(f"Input dim     : {INPUT_DIM}")
@@ -96,16 +150,23 @@ if __name__ == "__main__":
     detected_dim = sample_data['partial_feats'].shape[-1]
     print(f"🧬 Automatically detected feature dimension from factory output: {detected_dim}")
 
-    # Assert that the detected feature dimension matches the expected input dimension
-    assert detected_dim == INPUT_DIM, (
-        f"Dataset features ({detected_dim}) "
-        f"do not match encoder input ({INPUT_DIM})"
-    )
+    if detected_dim not in (1024, 1408):
+        raise ValueError(
+            f"Unsupported feature dimension {detected_dim}. Expected 1024 or 1408."
+        )
 
-    encoder = MultiModalFeatureEncoder(
-        input_feat_dim=INPUT_DIM,
-        latent_dim=512,
-    ).to(device)
+    INPUT_DIM = detected_dim
+    print(f"Using feature dimension: {INPUT_DIM}")
+
+    # Encoder selection based on the architecture
+    if ARCHITECTURE == "ours":
+        encoder = MultiModalFeatureEncoder(
+            input_feat_dim=INPUT_DIM,
+            latent_dim=512,
+        ).to(device)
+
+    elif ARCHITECTURE == "dinocomplete":
+        encoder = DinoCompleteBaselineEncoder().to(device)
 
     decoder = ImplicitDecoderBasic(
         latent_dim=1024,
@@ -136,23 +197,6 @@ if __name__ == "__main__":
 
     if LOAD_MODEL is not None:
 
-        if LOAD_MODEL == "latest":
-
-            checkpoint_dir = f"{RUN_DIR}/checkpoints"
-
-            checkpoint_files = glob.glob(
-                os.path.join(checkpoint_dir, "epoch_*.pth")
-            )
-
-            if checkpoint_files:
-
-                LOAD_MODEL = max(
-                    checkpoint_files,
-                    key=lambda x: int(
-                        re.search(r"epoch_(\d+)", x).group(1)
-                    )
-                )
-
         print(f"\nLoading weights from:\n{LOAD_MODEL}")
 
         checkpoint = torch.load(
@@ -162,23 +206,24 @@ if __name__ == "__main__":
 
         state = checkpoint["encoder_state_dict"]
 
-        # Rename ShapeNet projection to the new Utonia branch
-        renamed_state = {}
+        if ARCHITECTURE == "ours":
+            # Rename ShapeNet projection to the new Utonia branch
+            renamed_state = {}
+            for k, v in state.items():
+                if k.startswith("input_projection"):
+                    new_key = k.replace(
+                        "input_projection",
+                        "utonia_projection"
+                    )
+                else:
+                    new_key = k
 
-        for k, v in state.items():
-            if k.startswith("input_projection"):
-                new_key = k.replace("input_projection", "utonia_projection")
-            else:
-                new_key = k
+                renamed_state[new_key] = v
 
-            renamed_state[new_key] = v
-
-        state = renamed_state
+            state = renamed_state
 
         current = encoder.state_dict()
-
         compatible = {}
-
         loaded = []
         skipped = []
 
@@ -201,7 +246,7 @@ if __name__ == "__main__":
 
         encoder.load_state_dict(current)
 
-        # Verify how many weighttensors were loaded successfully
+        # Verify how many weight tensors were loaded successfully
         loaded = len(compatible)
         total = len(current)
 
@@ -223,26 +268,36 @@ if __name__ == "__main__":
     os.makedirs(f"{RUN_DIR}/snapshots", exist_ok=True)
     os.makedirs(f"{RUN_DIR}/checkpoints", exist_ok=True)
 
-    if MODE == "scannet_finetune":
-        epochs = 60
-    else:
+    if MODE == "shapenet_pretrain":
         epochs = 100
+    elif MODE == "shapenet_resume":
+        epochs = 100
+    elif MODE == "scannet_finetune":
+        epochs = 60
     
     # ==========================================
     # TRAINING CONFIGURATION
     # ==========================================
     with open(f"{RUN_DIR}/model_summary.txt", "w") as f:
-        f.write(f"Input feature dimension: {detected_dim}\n")
-        f.write("Input projection: input_dim -> 1024\n")
-        f.write("Encoder latent: 512\n")
-        f.write("Global latent (max+mean): 1024\n")
-        f.write("Decoder latent: 1024\n")
-        f.write("Hidden dim: 256\n")
-        f.write("Batch size: 32\n")
-        f.write(f"Epochs: {epochs}\n")
-        f.write("Optimizer: AdamW\n")
-        f.write(f"Learning rate: {LR}\n")
-        f.write(f"Parameters: {num_params:,}\n")
+        f.write(f"Architecture: {ARCHITECTURE}\n")
+
+        if ARCHITECTURE == "ours":
+            f.write(f"Input feature dimension: {detected_dim}\n")
+            f.write("Input projection: input_dim -> 1024\n")
+            f.write("Encoder latent: 512\n")
+            f.write("Global latent (max+mean): 1024\n")
+            f.write("Decoder latent: 1024\n")
+            f.write("Hidden dim: 256\n")
+            f.write("Batch size: 32\n")
+            f.write(f"Epochs: {epochs}\n")
+            f.write("Optimizer: AdamW\n")
+            f.write(f"Learning rate: {LR}\n")
+            f.write(f"Parameters: {num_params:,}\n")
+        else:
+            f.write("Geometry encoder: XYZ\n")
+            f.write("Semantic encoder: DINO\n")
+            f.write("Context: Shared Transformer\n")
+            f.write("Pooling: Attention\n")
 
     first_batch = next(iter(train_loader))
 

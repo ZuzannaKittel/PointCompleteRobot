@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import time
 
+from models.dinocomplete import DinoCompleteBaselineEncoder
+
 # ==========================================
 # Chamfer Distance Evaluation Metric
 # ==========================================
@@ -48,7 +50,7 @@ def fscore(pred_pts,
 # ==========================================
 # INFERENCE GRID SAMPLER (Utonia+DINOv2-Feature-Driven)
 # ==========================================
-def extract_implicit_shape(encoder, decoder, partial_feats, device, resolution=64, threshold=0.8):
+def extract_implicit_shape(encoder, decoder, partial_pts, partial_feats, device, resolution=64, threshold=0.8):
     encoder.eval()
     decoder.eval()
     with torch.no_grad():
@@ -56,7 +58,10 @@ def extract_implicit_shape(encoder, decoder, partial_feats, device, resolution=6
         start = time.time()
 
         # Build multi-modal structural latent vector
-        final_latent = encoder(partial_feats.unsqueeze(0))
+        if isinstance(encoder, DinoCompleteBaselineEncoder):
+            final_latent = encoder(partial_pts.unsqueeze(0), partial_feats.unsqueeze(0))
+        else:
+            final_latent = encoder(partial_feats.unsqueeze(0))
         
         # Query discrete locations across the scalar matrix field
         linear_spaces = torch.linspace(-0.5, 0.5, resolution, device=device)
@@ -120,8 +125,9 @@ def save_test_sample(sample_idx, prefix,
         RUN_DIR = get_run_dir()
 
     sample = test_dataset[sample_idx]
+    pts = sample["partial_pts"].to(device)
     feats = sample['partial_feats'].to(device)
-    recon_pts, inference_time = extract_implicit_shape(encoder, decoder, feats, device, resolution=128, threshold=0.8)
+    recon_pts, inference_time = extract_implicit_shape(encoder, decoder, pts, feats, device, resolution=128, threshold=0.8)
     if len(recon_pts) == 0:
         print(f"Skipping {prefix}: empty reconstruction")
         return
@@ -157,8 +163,9 @@ def evaluate_test_set(encoder, decoder, test_dataset, device, RUN_DIR=None):
     with torch.no_grad():
         for idx in range(len(test_dataset)):
             sample = test_dataset[idx]
+            pts = sample["partial_pts"].to(device)
             feats = sample['partial_feats'].to(device)
-            recon_pts, inference_time = extract_implicit_shape(encoder, decoder, feats, device, resolution=128, threshold=0.8)
+            recon_pts, inference_time = extract_implicit_shape(encoder, decoder, pts, feats, device, resolution=128, threshold=0.8)
 
             all_runtime.append(inference_time)
 
