@@ -18,19 +18,54 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
     if RUN_DIR is None:
         RUN_DIR = get_run_dir()
     Path(RUN_DIR).mkdir(parents=True, exist_ok=True)
+    Path(f"{RUN_DIR}/checkpoints").mkdir(parents=True, exist_ok=True)
+    Path(f"{RUN_DIR}/snapshots").mkdir(parents=True, exist_ok=True)
     # ------------------------------------------------
     # TRAINING LOOP
     # ------------------------------------------------
 
     # Initialize lists to track training and validation losses, as well as epoch times
-    train_losses = []
-    val_losses = []
-    epoch_times = []
-    learning_rates = []
+    # or resume training history
+    history_path = f"{RUN_DIR}/training_history.csv"
+    history_tmp_path = f"{RUN_DIR}/training_history.csv.tmp"
 
-    patience = 15  # Number of epochs to wait for improvement before early stopping
+    history_columns = [
+        "epoch",
+        "train_loss",
+        "val_loss",
+        "learning_rate",
+        "epoch_time_sec",
+        "best_val_so_far",
+    ]
 
+    if resume_training and os.path.exists(history_path):
+        history = pd.read_csv(history_path)
+
+        # Remove empty / malformed rows from interrupted runs.
+        history = history.dropna(how="all")
+        history = history.dropna(
+            subset=["epoch", "train_loss", "val_loss", "learning_rate", "epoch_time_sec"],
+            how="any",
+        )
+
+        history["epoch"] = history["epoch"].astype(int)
+        history = history.sort_values("epoch").reset_index(drop=True)
+
+        print(f"📂 Loaded {len(history)} previous epochs of history.")
+    else:
+        history = pd.DataFrame(columns=history_columns)
+
+    patience = 15
+    epochs_without_improvement = 0
     best_val_loss = float("inf")
+
+    if len(history) > 0 and start_epoch != 0:
+        last_logged_epoch = int(history["epoch"].max())
+        if start_epoch != last_logged_epoch:
+            print(
+                f"⚠️ start_epoch={start_epoch} but history ends at epoch "
+                f"{last_logged_epoch}. Logging will continue from the loaded history."
+            )
 
     if resume_training:
 
@@ -157,16 +192,23 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
         val_loss /= len(val_loader)
         scheduler.step(val_loss)
 
-        # Track the best validation loss and save the corresponding model checkpoint
-        train_losses.append(epoch_loss)
-        val_losses.append(val_loss)
-
         epoch_time = time.time() - epoch_start
-        epoch_times.append(epoch_time)
-
         current_lr = optimizer.param_groups[0]["lr"]
 
-        learning_rates.append(current_lr)
+        new_row = pd.DataFrame([{
+            "epoch": epoch + 1,
+            "train_loss": epoch_loss,
+            "val_loss": val_loss,
+            "learning_rate": current_lr,
+            "epoch_time_sec": epoch_time,
+        }])
+
+        history = pd.concat([history, new_row], ignore_index=True)
+        history["best_val_so_far"] = history["val_loss"].cummin()
+
+        # Atomic write so an interrupted job does not leave a broken CSV.
+        history.to_csv(history_tmp_path, index=False)
+        os.replace(history_tmp_path, history_path)
 
         print(
             f"📈 [Epoch {epoch+1:02d}/{epochs}] "
@@ -199,9 +241,9 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
         # --------------------------------------------------
         # CHECKPOINT + VISUALIZATION
         # --------------------------------------------------
-        if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
+        if (epoch + 1) % 3 == 0 or epoch == epochs - 1:
             # Save checkpoint
-            ckpt_path = (f"{RUN_DIR}/checkpoints/"f"epoch_{epoch+1:02d}.pth")
+            ckpt_path = (f"{RUN_DIR}/checkpoints/latest_model.pth")
             torch.save({
                 "epoch": epoch + 1,
                 "encoder_state_dict": encoder.state_dict(),
@@ -248,23 +290,14 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
             print(f"Early stopping at epoch {epoch+1}")
             break
 
-    # --------------------------------------------------
-    # Save training history to CSV for later analysis   
-    # --------------------------------------------------
-    history = pd.DataFrame({
-        "epoch": np.arange(1, len(train_losses)+1),
-        "train_loss": train_losses,
-        "val_loss": val_losses,
-        "learning_rate": learning_rates,
-        "epoch_time_sec": epoch_times
-    })
-
-    history["best_val_so_far"] = history["val_loss"].cummin()
-
-    history.to_csv(
-        f"{RUN_DIR}/training_history.csv",
-        index=False
+    # Final safety write.
+    history = history.dropna(how="all")
+    history = history.dropna(
+        subset=["epoch", "train_loss", "val_loss", "learning_rate", "epoch_time_sec"],
+        how="any",
     )
+    history["best_val_so_far"] = history["val_loss"].cummin()
+    history.to_csv(history_path, index=False)
 
     # Generate and save the training curve plot
     plt.figure(figsize=(8,5))
