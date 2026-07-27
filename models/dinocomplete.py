@@ -5,15 +5,8 @@ import torch.nn.functional as F
 
 class GeometryEncoder(nn.Module):
     """
-    Geometry branch.
-
-    Input:
-        xyz : [B, N, 3]
-
-    Output:
-        geom_features : [B, N, 512]
+    Geometry branch for point-based DinoComplete proxy.
     """
-
     def __init__(self, hidden_dim=256, out_dim=512):
         super().__init__()
         self.net = nn.Sequential(
@@ -31,17 +24,8 @@ class GeometryEncoder(nn.Module):
 
 class SemanticEncoder(nn.Module):
     """
-    Semantic branch.
-
-    Receives ONLY DINO features.
-
-    Input:
-        dino : [B, N, 384]
-
-    Output:
-        semantic : [B, N, 512]
+    Semantic branch for DINO descriptors.
     """
-
     def __init__(self, input_dim=384, hidden_dim=512):
         super().__init__()
         self.net = nn.Sequential(
@@ -58,18 +42,8 @@ class SemanticEncoder(nn.Module):
 
 class PointTransformerBlock(nn.Module):
     """
-    Global contextual reasoning block.
-
-    Point equivalent of DinoComplete's
-    voxel state-space operator.
-
-    Input:
-        [B, N, C]
-
-    Output:
-        [B, N, C]
+    Lightweight contextual reasoning block.
     """
-
     def __init__(self, embed_dim=512, num_heads=8, mlp_ratio=4, dropout=0.1):
         super().__init__()
         self.layer = nn.TransformerEncoderLayer(
@@ -88,10 +62,8 @@ class PointTransformerBlock(nn.Module):
 
 class AttentionPooling(nn.Module):
     """
-    Learns which point features are most informative
-    when constructing the global latent representation.
+    Attention pooling over point descriptors.
     """
-
     def __init__(self, dim=512):
         super().__init__()
         self.score = nn.Sequential(
@@ -101,18 +73,14 @@ class AttentionPooling(nn.Module):
         )
 
     def forward(self, x):
-        """
-        x : [B, N, C]
-        """
         weights = self.score(x)
         weights = torch.softmax(weights, dim=1)
-        pooled = torch.sum(weights * x, dim=1)
-        return pooled
+        return torch.sum(weights * x, dim=1)
 
 
 class DinoCompleteBaselineEncoder(nn.Module):
     """
-    DinoComplete-inspired baseline adapted to point clouds.
+    Point-based DinoComplete proxy.
 
     Geometry:
         XYZ
@@ -120,21 +88,28 @@ class DinoCompleteBaselineEncoder(nn.Module):
     Semantics:
         DINO only
 
-    Fusion:
-        Equation (9) from DinoComplete
-
-    Output:
-        1024-dimensional latent vector.
+    Design goal:
+        Keep the paper's separation of geometry and semantics,
+        plus contextual refinement and residual fusion,
+        while staying compatible with your point-based pipeline.
     """
 
     def __init__(self):
         super().__init__()
+
+        # Input normalisation helps when geometry and DINO features have different scales.
+        self.geo_input_norm = nn.LayerNorm(3)
+        self.sem_input_norm = nn.LayerNorm(384)
+
         self.geometry_encoder = GeometryEncoder()
         self.semantic_encoder = SemanticEncoder()
-        self.context = PointTransformerBlock(
-            embed_dim=512,
-            num_heads=8,
-        )
+
+        # Separate context blocks per branch, instead of one shared block.
+        self.geo_context = PointTransformerBlock(embed_dim=512, num_heads=8)
+        self.sem_context = PointTransformerBlock(embed_dim=512, num_heads=8)
+
+        # Small fusion norm to stabilise branch combination.
+        self.fusion_norm = nn.LayerNorm(512)
 
         self.pool = AttentionPooling(512)
 
@@ -143,20 +118,32 @@ class DinoCompleteBaselineEncoder(nn.Module):
             nn.GELU(),
         )
 
+        # Use the norm you already defined.
         self.output_norm = nn.LayerNorm(1024)
 
     def forward(self, partial_pts, partial_feats):
-        z_geo = self.geometry_encoder(partial_pts)
-        z_geo_context = self.context(z_geo)
-
+        # Split features
         dino = partial_feats[..., 1024:]
+
+        # Branch-specific input normalisation
+        partial_pts = self.geo_input_norm(partial_pts)
+        dino = self.sem_input_norm(dino)
+
+        # Separate geometry and semantic encoders
+        z_geo = self.geometry_encoder(partial_pts)
         z_sem = self.semantic_encoder(dino)
-        z_sem_context = self.context(z_sem)
 
-        fused = z_geo_context + z_sem_context + z_geo
+        # Residual contextual refinement per branch
+        z_geo = z_geo + self.geo_context(z_geo)
+        z_sem = z_sem + self.sem_context(z_sem)
 
+        # Fuse the two modalities while keeping the representation compact
+        fused = self.fusion_norm(z_geo + z_sem)
+
+        # Global aggregation
         latent = self.pool(fused)
         latent = self.projection(latent)
+        latent = self.output_norm(latent)
         latent = F.normalize(latent, dim=-1)
 
         return latent
