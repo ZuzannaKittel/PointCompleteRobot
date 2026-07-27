@@ -11,6 +11,7 @@ from models.dinocomplete import DinoCompleteBaselineEncoder
 from configs.run_config import RUN_DIR, get_run_decoder, get_run_model, get_run_name, get_run_dir
 from utils.evaluation import extract_implicit_shape
 
+THRESHOLD = 0.6
 
 def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs, start_epoch=0, RUN_NAME=None, RUN_DIR=None, resume_training=False):
     if RUN_NAME is None:
@@ -55,45 +56,45 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
     else:
         history = pd.DataFrame(columns=history_columns)
 
-    patience = 15
+    patience = 10
     epochs_without_improvement = 0
     best_val_loss = float("inf")
 
-    if len(history) > 0 and start_epoch != 0:
-        last_logged_epoch = int(history["epoch"].max())
-        if start_epoch != last_logged_epoch:
-            print(
-                f"⚠️ start_epoch={start_epoch} but history ends at epoch "
-                f"{last_logged_epoch}. Logging will continue from the loaded history."
-            )
-
     if resume_training:
+        best_ckpt_path = f"{RUN_DIR}/checkpoints/best_model.pth"
+        latest_ckpt_path = f"{RUN_DIR}/checkpoints/latest_model.pth"
 
-        checkpoint_path = f"{RUN_DIR}/checkpoints/best_model.pth"
-
-        if os.path.exists(checkpoint_path):
-
-            checkpoint = torch.load(
-                checkpoint_path,
-                map_location=device,
-            )
-
+        if os.path.exists(best_ckpt_path):
+            checkpoint = torch.load(best_ckpt_path, map_location=device)
             best_val_loss = checkpoint["val_loss"]
 
-            # Restore epochs_without_improvement
-            epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
+            if os.path.exists(latest_ckpt_path):
+                checkpoint_latest = torch.load(latest_ckpt_path, map_location=device)
+                epochs_without_improvement = checkpoint_latest.get("epochs_without_improvement", 0)
+            else:
+                epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
 
             print(
                 f"📂 Found previous best model "
                 f"(best validation loss = {best_val_loss:.6f})"
             )
 
+    if resume_training and len(history) > 0:
+        last_logged_epoch = int(history["epoch"].max())
+
+        if last_logged_epoch > start_epoch:
+            print(
+                f"⚠️ Trimming history from epoch {last_logged_epoch} "
+                f"down to checkpoint epoch {start_epoch}."
+            )
+            history = history[history["epoch"] <= start_epoch].reset_index(drop=True)
+
     # Create the LR scheduler ONCE
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
         factor=0.5,
-        patience=10,
+        patience=6,
     )
 
     config = {
@@ -105,7 +106,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
             "batch_size": 32,
             "learning_rate": optimizer.param_groups[0]["lr"],
             "hidden_dim": 256,
-            "threshold": 0.8,
+            "threshold": THRESHOLD,
             "resolution_eval": 128,
             "weight_decay": optimizer.param_groups[0]["weight_decay"]
         }
@@ -263,7 +264,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
                 v_feats = val_sample['partial_feats'].to(device)
 
                 # Extract implicit shape from the model
-                recon_pts, inference_time = extract_implicit_shape(encoder, decoder, v_pts, v_feats, device, resolution=128, threshold=0.8)
+                recon_pts, inference_time = extract_implicit_shape(encoder, decoder, v_pts, v_feats, device, resolution=128, threshold=THRESHOLD)
 
                 base_snap_path = (f"{RUN_DIR}/snapshots/"f"epoch_{epoch+1:02d}_obj{sample_idx}")
                 

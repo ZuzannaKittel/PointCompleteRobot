@@ -10,6 +10,8 @@ import time
 
 from models.dinocomplete import DinoCompleteBaselineEncoder
 
+THRESHOLD = 0.6
+
 # ==========================================
 # Chamfer Distance Evaluation Metric
 # ==========================================
@@ -50,7 +52,7 @@ def fscore(pred_pts,
 # ==========================================
 # INFERENCE GRID SAMPLER (Utonia+DINOv2-Feature-Driven)
 # ==========================================
-def extract_implicit_shape(encoder, decoder, partial_pts, partial_feats, device, resolution=64, threshold=0.8):
+def extract_implicit_shape(encoder, decoder, partial_pts, partial_feats, device, resolution=64, threshold=0.5):
     encoder.eval()
     decoder.eval()
     with torch.no_grad():
@@ -127,7 +129,7 @@ def save_test_sample(sample_idx, prefix,
     sample = test_dataset[sample_idx]
     pts = sample["partial_pts"].to(device)
     feats = sample['partial_feats'].to(device)
-    recon_pts, inference_time = extract_implicit_shape(encoder, decoder, pts, feats, device, resolution=128, threshold=0.8)
+    recon_pts, inference_time = extract_implicit_shape(encoder, decoder, pts, feats, device, resolution=128, threshold=THRESHOLD)
     if len(recon_pts) == 0:
         print(f"Skipping {prefix}: empty reconstruction")
         return
@@ -165,21 +167,25 @@ def evaluate_test_set(encoder, decoder, test_dataset, device, RUN_DIR=None):
             sample = test_dataset[idx]
             pts = sample["partial_pts"].to(device)
             feats = sample['partial_feats'].to(device)
-            recon_pts, inference_time = extract_implicit_shape(encoder, decoder, pts, feats, device, resolution=128, threshold=0.8)
+            recon_pts, inference_time = extract_implicit_shape(encoder, decoder, pts, feats, device, resolution=128, threshold=THRESHOLD)
 
             all_runtime.append(inference_time)
 
-            if len(recon_pts) == 0:
-                continue
+            valid_reconstruction = len(recon_pts) > 0
 
             centroid = sample['centroid'].numpy()
             scale_factor = sample['scale_factor'].item()
-            recon_world = (recon_pts / scale_factor) + centroid
-            gt_world = sample['gt_pts_world'].numpy()
-            cd = chamfer_distance(recon_world, gt_world)
 
-            fs = fscore(recon_world,
-                        gt_world)
+            if valid_reconstruction:
+                recon_world = (recon_pts / scale_factor) + centroid
+                gt_world = sample['gt_pts_world'].numpy()
+                cd = chamfer_distance(recon_world, gt_world)
+                fs = fscore(recon_world, gt_world)
+            else:
+                recon_world = None
+                gt_world = sample['gt_pts_world'].numpy()
+                cd = np.nan
+                fs = np.nan
 
             all_fscore.append(fs)
             
@@ -187,12 +193,15 @@ def evaluate_test_set(encoder, decoder, test_dataset, device, RUN_DIR=None):
                 "idx": idx,
                 "file": os.path.basename(test_dataset.file_paths[idx]),
                 "category": os.path.basename(test_dataset.file_paths[idx]).split("_")[-2],
-                "cd": float(cd),
-                "fscore": float(fs),
-                "runtime": inference_time
+                "cd": float(cd) if not np.isnan(cd) else np.nan,
+                "fscore": float(fs) if not np.isnan(fs) else np.nan,
+                "runtime": inference_time,
+                "num_pred_pts": int(len(recon_pts)),
+                "valid_reconstruction": valid_reconstruction,
             })
 
             all_cd.append(cd)
+
             if (idx + 1) % 25 == 0:
                 print(f"Processed {idx+1}/{len(test_dataset)}")
 
@@ -211,18 +220,20 @@ def evaluate_test_set(encoder, decoder, test_dataset, device, RUN_DIR=None):
         index=False
     )
 
-    results = sorted(results, key=lambda x: x["cd"])
+    valid_results = [r for r in results if not np.isnan(r["cd"])]
+    valid_results = sorted(valid_results, key=lambda x: x["cd"])
 
     pd.DataFrame(results).to_csv(
         f"{RUN_DIR}/test_results.csv",
         index=False
     )
 
-    if len(results) == 0:
+    if len(valid_results) == 0:
         print("No valid reconstructions found.")
         return
 
     df = pd.DataFrame(results)
+
     category_df = (
         df
         .groupby("category")
@@ -240,9 +251,9 @@ def evaluate_test_set(encoder, decoder, test_dataset, device, RUN_DIR=None):
         f"{RUN_DIR}/category_results.csv"
     )
 
-    best_idx = results[0]["idx"]
-    median_idx = results[len(results)//2]["idx"]
-    worst_idx = results[-1]["idx"]
+    best_idx = valid_results[0]["idx"]
+    median_idx = valid_results[len(valid_results)//2]["idx"]
+    worst_idx = valid_results[-1]["idx"]
 
     os.makedirs(f"{RUN_DIR}/test_debug", exist_ok=True)
 
@@ -252,22 +263,26 @@ def evaluate_test_set(encoder, decoder, test_dataset, device, RUN_DIR=None):
 
     save_test_sample(worst_idx, "worst", encoder, decoder, test_dataset, device)
 
-    print("Best sample:", results[0])
-    print("Worst sample:", results[-1])
+    print("Best sample:", valid_results[0])
+    print("Worst sample:", valid_results[-1])
 
-    print(f"Std Chamfer: {np.std(all_cd):.6f}")
+    valid_cd = np.array([x for x in all_cd if not np.isnan(x)])
+    valid_fs = np.array([x for x in all_fscore if not np.isnan(x)])
+
+    print(f"Std Chamfer: {np.std(valid_cd):.6f}")
 
     print("\n==============================")
-    print(f"Mean Chamfer:   {np.mean(all_cd):.6f}")
-    print(f"Median Chamfer: {np.median(all_cd):.6f}")
-    print(f"Best Chamfer:   {np.min(all_cd):.6f}")
-    print(f"Worst Chamfer:  {np.max(all_cd):.6f}")
-    print(f"Mean F-score:   {np.mean(all_fscore):.4f}")
-    print(f"Median F-score: {np.median(all_fscore):.4f}")
+    print(f"Mean Chamfer:   {np.mean(valid_cd):.6f}")
+    print(f"Median Chamfer:  {np.median(valid_cd):.6f}")
+    print(f"Best Chamfer:    {np.min(valid_cd):.6f}")
+    print(f"Worst Chamfer:   {np.max(valid_cd):.6f}")
+    print(f"Mean F-score:    {np.mean(valid_fs):.4f}")
+    print(f"Median F-score:  {np.median(valid_fs):.4f}")
+    print(f"Valid samples:   {len(valid_cd)}/{len(test_dataset)}")
     print("==============================")
 
     plt.figure(figsize=(7,5))
-    plt.hist(all_cd, bins=30)
+    plt.hist(valid_cd, bins=30)
     plt.grid(alpha=0.3)
     plt.xlabel("Chamfer Distance")
     plt.ylabel("Count")
@@ -280,13 +295,15 @@ def evaluate_test_set(encoder, decoder, test_dataset, device, RUN_DIR=None):
     plt.close()
 
     summary = pd.DataFrame({
-        "mean_cd":[np.mean(all_cd)],
-        "median_cd":[np.median(all_cd)],
-        "best_cd":[np.min(all_cd)],
-        "worst_cd":[np.max(all_cd)],
-        "std_cd":[np.std(all_cd)],
-        "mean_fscore":[np.mean(all_fscore)],
-        "median_fscore":[np.median(all_fscore)]
+        "mean_cd": [np.mean(valid_cd) if len(valid_cd) > 0 else np.nan],
+        "median_cd": [np.median(valid_cd) if len(valid_cd) > 0 else np.nan],
+        "best_cd": [np.min(valid_cd) if len(valid_cd) > 0 else np.nan],
+        "worst_cd": [np.max(valid_cd) if len(valid_cd) > 0 else np.nan],
+        "std_cd": [np.std(valid_cd) if len(valid_cd) > 0 else np.nan],
+        "mean_fscore": [np.mean(valid_fs) if len(valid_fs) > 0 else np.nan],
+        "median_fscore": [np.median(valid_fs) if len(valid_fs) > 0 else np.nan],
+        "valid_samples": [len(valid_cd)],
+        "total_samples": [len(test_dataset)],
     })
 
     summary.to_csv(
