@@ -32,35 +32,17 @@ if __name__ == "__main__":
     # ==========================================================
     
     # TODO: Select the ARCHITECTURE
+    #ARCHITECTURE = "dinocomplete"
     ARCHITECTURE = "ours"
-    # ARCHITECTURE = "dinocomplete"
 
-    # TODO: Select the MODE
-    MODE = "shapenet_resume"
-    # MODE = "shapenet_pretrain"
-    # MODE = "shapenet_resume"
+    MODE = "scannet_train"
 
-    if MODE == "shapenet_pretrain":
-        DATA_DIR = "data/pairs_shapenet/train/*.pt"
-        INPUT_DIM = 1024 if ARCHITECTURE == "ours" else 1408
-        LR = 5e-4
-        LOAD_MODEL = None
-        WD = 1e-4
-        RUN_NAME = "shapenet_pretraining"
-    elif MODE == "shapenet_resume":
-        DATA_DIR = "data/pairs_shapenet/train/*.pt"
-        INPUT_DIM = 1024 if ARCHITECTURE == "ours" else 1408
-        LR = 5e-4
-        LOAD_MODEL = "best"
-        WD = 1e-4
-        RUN_NAME = "shapenet_pretraining"
-    elif MODE == "scannet_finetune":
-        DATA_DIR = "data/geometric_pairs_dataset2/train/*.pt"
-        INPUT_DIM = 1408
-        LR = 1e-4
-        WD = 5e-5
-        RUN_NAME = "scannet_finetuning"
-        LOAD_MODEL = "best"
+    DATA_DIR = "data/pairs_scannet/train/*.pt"
+
+    LR = 1e-3
+    WD = 1e-4
+
+    RUN_NAME = "scannet_train"
 
     if ARCHITECTURE == "ours":
         RUN_NAME += "_ours"
@@ -69,53 +51,25 @@ if __name__ == "__main__":
 
     RUN_DIR = os.path.join("runs", RUN_NAME)
 
-    # -------------------------------------------------------
     # Determine which checkpoint (if any) should be loaded.
-    #
-    # shapenet_pretrain  -> start from scratch
-    # shapenet_resume    -> resume this exact run if available
-    # scannet_finetune   -> initialize from ShapeNet pretraining if available
-    # -------------------------------------------------------
+    resume_ckpt = os.path.join(
+        RUN_DIR,
+        "checkpoints",
+        "latest_model.pth",
+    )
 
-    if MODE == "shapenet_pretrain":
-        LOAD_MODEL = None
+    LOAD_MODEL = resume_ckpt if os.path.exists(resume_ckpt) else None
 
-    elif MODE == "shapenet_resume":
-        resume_ckpt = os.path.join(RUN_DIR, "checkpoints", "best_model.pth")
-        LOAD_MODEL = resume_ckpt if os.path.exists(resume_ckpt) else None
-
-        if LOAD_MODEL is None:
-            raise FileNotFoundError("Resume requested but no checkpoint was found.")
-
-    elif MODE == "scannet_finetune":
-        PRETRAIN_RUN = (
-            "shapenet_pretraining_ours"
-            if ARCHITECTURE == "ours"
-            else "shapenet_pretraining_dinocomplete"
-        )
-
-        pretrain_ckpt = os.path.join(
-            "runs",
-            PRETRAIN_RUN,
-            "checkpoints",
-            "best_model.pth",
-        )
-
-        if os.path.exists(pretrain_ckpt):
-            LOAD_MODEL = pretrain_ckpt
-        else:
-            LOAD_MODEL = None
-            print(
-                f"Pretraining checkpoint not found: {pretrain_ckpt}\n"
-                "Training will start from scratch."
-            )
+    if LOAD_MODEL is None:
+        print("No previous checkpoint found. Starting from scratch.")
+    else:
+        print(f"Resuming from {LOAD_MODEL}")
 
     print(f"Training mode : {MODE}")
     print(f"Architecture  : {ARCHITECTURE}")
     print(f"Checkpoint    : {LOAD_MODEL}")
     print(f"Dataset       : {DATA_DIR}")
     print(f"Learning rate : {LR}")
-    print(f"Input dim     : {INPUT_DIM}")
 
     data_files = glob.glob(DATA_DIR)
     if not data_files:
@@ -256,24 +210,19 @@ if __name__ == "__main__":
             checkpoint["decoder_state_dict"]
         )
 
-        # only resume optimizer if continuing SAME experiment
-        if MODE == "shapenet_resume":
+        # Resume optimizer and epoch when continuing the same ScanNet run
+        optimizer.load_state_dict(
+            checkpoint["optimizer_state_dict"]
+        )
 
-            optimizer.load_state_dict(
-                checkpoint["optimizer_state_dict"]
-            )
+        start_epoch = checkpoint["epoch"]
 
-            start_epoch = checkpoint["epoch"]
+        print(f"Resuming from epoch {start_epoch}")
 
     os.makedirs(f"{RUN_DIR}/snapshots", exist_ok=True)
     os.makedirs(f"{RUN_DIR}/checkpoints", exist_ok=True)
 
-    if MODE == "shapenet_pretrain":
-        epochs = 100
-    elif MODE == "shapenet_resume":
-        epochs = 100
-    elif MODE == "scannet_finetune":
-        epochs = 60
+    epochs = 150
     
     # ==========================================
     # TRAINING CONFIGURATION
@@ -298,6 +247,10 @@ if __name__ == "__main__":
             f.write("Semantic encoder: DINO\n")
             f.write("Context: Shared Transformer\n")
             f.write("Pooling: Attention\n")
+            f.write(f"Epochs: {epochs}\n")
+            f.write("Optimizer: AdamW\n")
+            f.write(f"Learning rate: {LR}\n")
+            f.write(f"Parameters: {num_params:,}\n")
 
     first_batch = next(iter(train_loader))
 
@@ -321,10 +274,23 @@ if __name__ == "__main__":
         start_epoch=start_epoch,
         RUN_NAME=RUN_NAME,
         RUN_DIR=RUN_DIR,
-        resume_training=(MODE == "shapenet_resume"),
+        resume_training=(LOAD_MODEL is not None),
     )
 
     print("\n🏁 Framework routine finished. Run your evaluation snapshots through CloudCompare to see the improvements.")
+
+    # Load best model for evaluation
+    best_ckpt = torch.load(
+        os.path.join(
+            RUN_DIR,
+            "checkpoints",
+            "best_model.pth"
+        ),
+        map_location=device
+    )
+
+    encoder.load_state_dict(best_ckpt["encoder_state_dict"])
+    decoder.load_state_dict(best_ckpt["decoder_state_dict"])
 
     # --- FINAL TEST SET EVALUATION ---
     evaluate_test_set(encoder, decoder, test_dataset, device, RUN_DIR=RUN_DIR)

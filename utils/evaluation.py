@@ -52,7 +52,7 @@ def fscore(pred_pts,
 # ==========================================
 # INFERENCE GRID SAMPLER (Utonia+DINOv2-Feature-Driven)
 # ==========================================
-def extract_implicit_shape(encoder, decoder, partial_pts, partial_feats, device, resolution=64, threshold=0.5):
+def extract_implicit_shape(encoder, decoder, partial_pts, partial_feats, device, resolution=64, threshold=0.5, RUN_DIR=None):
     encoder.eval()
     decoder.eval()
     with torch.no_grad():
@@ -81,14 +81,14 @@ def extract_implicit_shape(encoder, decoder, partial_pts, partial_feats, device,
         probabilities = torch.sigmoid(total_logits).squeeze(0)
 
         # Compute quantiles for occupancy probabilities
-        """print(
+        print(
             f"Occupancy stats | "
             f"min={probabilities.min():.6f} "
             f"mean={probabilities.mean():.6f} "
             f"max={probabilities.max():.6f}"
-        )"""
+        )
 
-        """ # Determine the occupancy threshold for reconstruction
+        # Determine the occupancy threshold for reconstruction
         thresholds = [0.5, 0.6, 0.7, 0.8]
 
         for thresh in thresholds:
@@ -99,8 +99,8 @@ def extract_implicit_shape(encoder, decoder, partial_pts, partial_feats, device,
             trimesh.points.PointCloud(
                 pts.astype(np.float32)
             ).export(
-                f"recon_thresh_{thresh:.1f}.ply"
-            )"""
+                f"{RUN_DIR}/recon_thresh_{thresh:.1f}.ply"
+            )
     
         reconstructed_mask = probabilities > threshold
         reconstructed_points = eval_coords.squeeze(0)[reconstructed_mask].cpu().numpy()
@@ -125,6 +125,8 @@ def save_test_sample(sample_idx, prefix,
                      RUN_DIR=None):
     if RUN_DIR is None:
         RUN_DIR = get_run_dir()
+
+    os.makedirs(f"{RUN_DIR}/test_debug", exist_ok=True)
 
     sample = test_dataset[sample_idx]
     pts = sample["partial_pts"].to(device)
@@ -167,7 +169,7 @@ def evaluate_test_set(encoder, decoder, test_dataset, device, RUN_DIR=None):
             sample = test_dataset[idx]
             pts = sample["partial_pts"].to(device)
             feats = sample['partial_feats'].to(device)
-            recon_pts, inference_time = extract_implicit_shape(encoder, decoder, pts, feats, device, resolution=128, threshold=THRESHOLD)
+            recon_pts, inference_time = extract_implicit_shape(encoder, decoder, pts, feats, device, resolution=128, threshold=THRESHOLD, RUN_DIR=RUN_DIR)
 
             all_runtime.append(inference_time)
 
@@ -257,11 +259,9 @@ def evaluate_test_set(encoder, decoder, test_dataset, device, RUN_DIR=None):
 
     os.makedirs(f"{RUN_DIR}/test_debug", exist_ok=True)
 
-    save_test_sample(best_idx, "best", encoder, decoder, test_dataset, device)
-
-    save_test_sample(median_idx, "median", encoder, decoder, test_dataset, device)
-
-    save_test_sample(worst_idx, "worst", encoder, decoder, test_dataset, device)
+    save_test_sample(best_idx, "best", encoder, decoder, test_dataset, device, RUN_DIR=RUN_DIR)
+    save_test_sample(median_idx, "median", encoder, decoder, test_dataset, device, RUN_DIR=RUN_DIR)
+    save_test_sample(worst_idx, "worst", encoder, decoder, test_dataset, device, RUN_DIR=RUN_DIR)
 
     print("Best sample:", valid_results[0])
     print("Worst sample:", valid_results[-1])
