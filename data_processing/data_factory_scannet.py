@@ -378,11 +378,10 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
             # --- 3. EXECUTION ---
             try:
                 s_pts, u_feats, d_feats, fused_pointwise = engine.get_multi_view_tsdf_object(
-                    sweep_frames, 
+                    sweep_frames,
                     obj,
-                    T_obj,
-                    obb_data, 
-                    num_pts=2048 
+                    obb_data,
+                    num_pts=2048
                 )
                 print(f"   ☑️ Partial point cloud extracted with {s_pts.shape[0]} points.")
             except Exception as e:

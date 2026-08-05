@@ -162,9 +162,6 @@ class SceneDataEngine:
         # 4. Apply a uniform scaling factor to fit the CAD into a canonical space, leaving a small margin (0.9) to avoid touching the boundaries
         gt_canonical = gt_centered / (extent + 1e-8) * 0.9
 
-        print("GT extent:", np.ptp(gt_canonical, axis=0))
-        print("GT mean:", gt_canonical.mean(axis=0))
-
         return gt_canonical
 
     def _tsdf_hash(self, p, voxel_size):
@@ -215,9 +212,10 @@ class SceneDataEngine:
         filtered = points_world[keep]
         return filtered
 
-    def get_multi_view_tsdf_object(self, frame_indices, selected_box, obj_transform, obb_data, num_pts=2048):
-        # This function extracts a multi-view TSDF object cloud, applies SAM masking,
-        # canonicalizes it to the OBB frame, and fuses DINO and Utonia features.
+    def get_multi_view_tsdf_object(self, frame_indices, selected_box, obb_data, num_pts=2048):
+        # Build a multi-view TSDF object cloud, crop it to the OBB,
+        # canonicalize it with the annotated CAD transform, and fuse
+        # DINO and Utonia features.
         from utils.utils import load_data, project_world_to_pixel, get_dino_features_bilinear
 
         scene_root = os.path.dirname(self.paths["json"])
@@ -234,7 +232,7 @@ class SceneDataEngine:
         # ============================================================
         # 2. LOAD FRAMES AND PROJECT
         # ============================================================
-        for i, f_idx in enumerate(frame_indices):
+        for f_idx in frame_indices:
             frame_key = f"frame_{f_idx:06d}"
             print(f"Processing {frame_key}")
             rgb_path = os.path.join(scene_root, "rgb", f"{frame_key}.jpg")
@@ -313,18 +311,10 @@ class SceneDataEngine:
             if mask_2d.shape != depth.shape:
                 mask_2d = cv2.resize(mask_2d.astype(np.uint8), (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
 
-            depth_valid = (depth > 0.1) & (depth < 4.5)
-
             semantic_valid = (mask_2d > 0) & (depth > 0.1) & (depth < 4.5)
 
             if np.count_nonzero(semantic_valid) < 500:
                 continue
-
-            print(
-                f"  mask pixels: {np.count_nonzero(mask_2d)}, "
-                f"valid depth: {np.count_nonzero(depth_valid)}, "
-                f"semantic: {np.count_nonzero(semantic_valid)}"
-            )
 
             z_cam = depth[semantic_valid]
             if len(z_cam) == 0:
@@ -348,16 +338,11 @@ class SceneDataEngine:
             y_cam = (v_valid - cy_depth) * z_cam / fy_depth
             
             pts_cam = np.stack([x_cam, y_cam, z_cam, np.ones_like(z_cam)], axis=-1)
-            print(">>> Backprojecting points...")
             pts_world = (c2w @ pts_cam.T).T[:, :3]
-            print(f">>> World points: {len(pts_world)}")
-
-            print(">>> Cropping with OBB...")
             crop_mask = self.get_obb_mask(pts_world, obb_data)
-            print(">>> OBB crop finished")
             pts_cropped = pts_world[crop_mask]
 
-            # Guard against frames where the OBB crop removes too many points, which may indicate mask leakage or misalignment.
+            # Skip frames where the OBB crop removes too much geometry.
             frame_pass_rate = len(pts_cropped) / max(len(pts_world), 1)
             if frame_pass_rate < 0.3:
                 print(f"  ⚠️ frame {frame_key}: only {frame_pass_rate:.1%} of backprojected points "
@@ -369,27 +354,18 @@ class SceneDataEngine:
                 continue
 
             pts_verified_frame = pts_cropped
-            keep_ratio = (
-                len(pts_verified_frame) / (len(pts_cropped) + 1e-8)
-                if len(pts_cropped) > 0 else 0.0
-            )
-
-            print(
-                f"  frame {frame_key}: cropped={len(pts_cropped)}, "
-                f"verified={len(pts_verified_frame)}, keep_ratio={keep_ratio:.3f}"
-            )
 
             # ============================================================
             # FRAME FILTER
             # ============================================================
 
-            min_points = 80 # to keep small but valid frames
+            min_points = 80  # Keep small but valid frames.
 
             if len(pts_verified_frame) < min_points:
                 continue
-                            
-            # Score based on the geometry richness and mask quality and consistency
-            #score = len(pts_cropped) * (np.count_nonzero(semantic_valid) / (mask_2d.size + 1e-8))
+
+            # Rank frames by the amount of geometry they contribute relative
+            # to the median observed depth.
             coverage = len(pts_verified_frame)
             distance = np.median(depth[semantic_valid])
 
@@ -474,25 +450,9 @@ class SceneDataEngine:
 
         pts_world_all = np.asarray(pcd.points)
 
-        print("\n========== TSDF DEBUG ==========")
-
-        print("TSDF count:", len(pts_world_all))
-
-        print(
-            "TSDF bbox:",
-            np.ptp(pts_world_all, axis=0)
-        )
-
-        print(
-            "TSDF center:",
-            pts_world_all.mean(axis=0)
-        )
-
         # Guard against empty or too small point clouds after TSDF fusion
         if len(pts_world_all) < 500:
             return None
-
-        print("TSDF points:", len(pts_world_all))
 
         # Crop with OBB again to remove any stray points outside the object
         mask = self.get_obb_mask(pts_world_all, obb_data)
@@ -501,10 +461,6 @@ class SceneDataEngine:
         # Guard against empty or too small point clouds after OBB cropping
         if len(pts_world_all) < 500:
             return None
-
-        print("After final OBB crop:", len(pts_world_all))
-
-        print(f"Points after final OBB crop: {len(pts_world_all)}, Mean mask value: {np.mean(mask)}")
 
         # ============================================================
         # 4. CANONICALIZATION
@@ -532,62 +488,11 @@ class SceneDataEngine:
         translation_anchor = obb_center
         rotate_transform = selected_box.transform_dict["rotate_transform"]
 
-        R = rotate_transform.get_matrix()[0, :3, :3].numpy()
-
-        print(np.linalg.det(R))
-        print(R @ R.T)
-
         cad_native_centered = (pts_world_all - translation_anchor) @ COORD_FIX
         pts_t = torch.from_numpy(cad_native_centered).float().unsqueeze(0)
         local_pts = rotate_transform.inverse().transform_points(pts_t).squeeze(0).cpu().numpy()
 
-        print("Rotated extents:", np.ptp(local_pts, axis=0))
-
-        # Does obb_data's box actually match the annotated CAD alignment?
         rotate_transform = selected_box.transform_dict["rotate_transform"]
-        translate_transform = selected_box.transform_dict["translate_transform"]
-        scale_transform = selected_box.transform_dict["scale_transform"]
-
-        print("translate:")
-        print(translate_transform.get_matrix())
-
-        print("rotate:")
-        print(rotate_transform.get_matrix())
-
-        print("scale:")
-        print(scale_transform.get_matrix())
-
-        origin = torch.zeros((1, 1, 3))
-
-        print(
-            "translated origin:",
-            translate_transform.transform_points(origin)
-        )
-
-        print(
-            "rotated origin:",
-            rotate_transform.transform_points(origin)
-        )
-
-        print(
-            "scaled origin:",
-            scale_transform.transform_points(origin)
-        )
-
-        print("obb centroid")
-        print(obb_center)
-
-        zero = torch.zeros((1, 1, 3))
-        composed = scale_transform.compose(rotate_transform).compose(translate_transform)
-        world_origin = composed.transform_points(zero).squeeze().numpy()
-
-        print("CAD origin mapped into world space:", world_origin)
-        print("obb_data centroid:                 ", obb_center)
-        print("difference:                        ", world_origin - obb_center)
-
-        R_cad = rotate_transform.get_matrix()[0, :3, :3].numpy()
-        print("rotate_transform 3x3:\n", R_cad)
-        print("obb_axes:\n", obb_axes)
 
         # ============================================================
         # 5. FILTERING
@@ -619,32 +524,11 @@ class SceneDataEngine:
         if len(filtered_pts) < 500:
             return None
 
-        print("\n========== OBB DEBUG ==========")
-
-        print("Before OBB:")
-        print("count:", len(pts_world_all))
-        print("extent:", np.ptp(pts_world_all, axis=0))
-
-
-        print("After OBB:")
-        print("count:", len(filtered_pts))
-        print("extent:", np.ptp(filtered_pts, axis=0))
-
-        obb_ratio = len(filtered_pts) / len(pts_world_all)
-
-        print(
-            "OBB retention ratio:",
-            obb_ratio
-        )
-        
         # ============================================================
         # 6. NORMALIZATION -- unaffected by rotation, box scale is fine as-is
         # ============================================================
         scale = np.max(np.asarray(obb_data["axesLengths"], dtype=np.float64))
         clean_pts_canonical = filtered_pts / (scale + 1e-8) * 0.9
-
-        print("Partial extent:", np.ptp(clean_pts_canonical, axis=0))
-        print("Partial mean:", clean_pts_canonical.mean(axis=0))
 
         # ============================================================
         # 7. DINO FEATURES
@@ -668,8 +552,5 @@ class SceneDataEngine:
             (u_feats.detach().cpu().numpy() if hasattr(u_feats, 'detach') else u_feats),
             d_feats
         ])
-
-        print("FINAL CLOUD SIZE:", len(clean_pts_world_actual))
-        print("FINAL CANONICAL SIZE:", len(clean_pts_canonical))
 
         return s_pts, u_feats, d_feats, fused_pointwise
