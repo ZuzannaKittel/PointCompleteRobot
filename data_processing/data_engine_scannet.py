@@ -51,7 +51,6 @@ def mask_check(mask, uv):
     v = np.clip(np.round(uv[:, 1]).astype(int), 0, mask.shape[0] - 1)
     return mask[v, u] > 0
 
-
 class SceneDataEngine:
     def __init__(self, paths, sam, dino, utonia):
         self.paths = paths
@@ -132,6 +131,7 @@ class SceneDataEngine:
         return pts_sampled, aligned_point_feats, idx
 
     def get_ground_truth(self, selected_box, shapenet_root, category, obb_data):
+    
         """Load and rescale a CAD model into a canonical reference frame."""
         if selected_box is None or not hasattr(selected_box, 'catid_cad'):
             return None
@@ -162,8 +162,11 @@ class SceneDataEngine:
         # 4. Apply a uniform scaling factor to fit the CAD into a canonical space, leaving a small margin (0.9) to avoid touching the boundaries
         gt_canonical = gt_centered / (extent + 1e-8) * 0.9
 
+        print("GT extent:", np.ptp(gt_canonical, axis=0))
+        print("GT mean:", gt_canonical.mean(axis=0))
+
         return gt_canonical
-    
+
     def _tsdf_hash(self, p, voxel_size):
         return tuple(np.floor(p / voxel_size).astype(np.int32))
     
@@ -212,7 +215,7 @@ class SceneDataEngine:
         filtered = points_world[keep]
         return filtered
 
-    def get_multi_view_tsdf_object(self, frame_indices, obj_transform, obb_data, num_pts=2048):
+    def get_multi_view_tsdf_object(self, frame_indices, selected_box, obj_transform, obb_data, num_pts=2048):
         # This function extracts a multi-view TSDF object cloud, applies SAM masking,
         # canonicalizes it to the OBB frame, and fuses DINO and Utonia features.
         from utils.utils import load_data, project_world_to_pixel, get_dino_features_bilinear
@@ -354,6 +357,13 @@ class SceneDataEngine:
             print(">>> OBB crop finished")
             pts_cropped = pts_world[crop_mask]
 
+            # Guard against frames where the OBB crop removes too many points, which may indicate mask leakage or misalignment.
+            frame_pass_rate = len(pts_cropped) / max(len(pts_world), 1)
+            if frame_pass_rate < 0.3:
+                print(f"  ⚠️ frame {frame_key}: only {frame_pass_rate:.1%} of backprojected points "
+                    f"fall inside the OBB -- likely mask leakage, skipping")
+                continue
+
             if len(pts_cropped) == 0:
                 print("⚠️ EMPTY CROPPED CLOUD — check OBB projection / SAM bbox")
                 continue
@@ -464,6 +474,20 @@ class SceneDataEngine:
 
         pts_world_all = np.asarray(pcd.points)
 
+        print("\n========== TSDF DEBUG ==========")
+
+        print("TSDF count:", len(pts_world_all))
+
+        print(
+            "TSDF bbox:",
+            np.ptp(pts_world_all, axis=0)
+        )
+
+        print(
+            "TSDF center:",
+            pts_world_all.mean(axis=0)
+        )
+
         # Guard against empty or too small point clouds after TSDF fusion
         if len(pts_world_all) < 500:
             return None
@@ -483,75 +507,158 @@ class SceneDataEngine:
         print(f"Points after final OBB crop: {len(pts_world_all)}, Mean mask value: {np.mean(mask)}")
 
         # ============================================================
-        # 4. CANONICALIZATION FROM OBSERVED GEOMETRY ONLY
+        # 4. CANONICALIZATION
         # ============================================================
-        # Translation is removed by centering the reconstructed object.
-        # Rotation is preserved in the ScanNet world frame.
-        # No ground-truth pose or object orientation is used.
+        # Rotation: selected_box's own annotated CAD alignment
+        # (rotate_transform), NOT obb_axes -- obb_axes is a box fit to the
+        # visible scan and has no reliable relationship to the CAD's
+        # canonical pose (confirmed via exhaustive signed-permutation
+        # search finding no match at all).
+        #
+        # Translation & scale: from obb_data, validated consistent with
+        # the CAD's own annotated position (within ~2-10cm across
+        # different scenes) once COORD_FIX is applied.
+        #
+        # COORD_FIX: fixed axis-order difference between obb_data's and
+        # transform_dict's world-coordinate serialization. Confirmed
+        # identical across >=2 different scenes -- a dataset convention,
+        # not a per-object fit.
+        COORD_FIX = np.array([
+            [0, 0, 1],
+            [1, 0, 0],
+            [0, 1, 0],
+        ], dtype=np.float64)
 
-        world_centroid = pts_world_all.mean(axis=0)
+        translation_anchor = obb_center
+        rotate_transform = selected_box.transform_dict["rotate_transform"]
 
-        local_pts = pts_world_all - world_centroid
+        R = rotate_transform.get_matrix()[0, :3, :3].numpy()
 
-        print("Observed extents:", np.ptp(local_pts, axis=0))
+        print(np.linalg.det(R))
+        print(R @ R.T)
 
-        bbox = np.ptp(local_pts, axis=0)
+        cad_native_centered = (pts_world_all - translation_anchor) @ COORD_FIX
+        pts_t = torch.from_numpy(cad_native_centered).float().unsqueeze(0)
+        local_pts = rotate_transform.inverse().transform_points(pts_t).squeeze(0).cpu().numpy()
 
-        print("Extent after OBB rotation:", bbox)
+        print("Rotated extents:", np.ptp(local_pts, axis=0))
+
+        # Does obb_data's box actually match the annotated CAD alignment?
+        rotate_transform = selected_box.transform_dict["rotate_transform"]
+        translate_transform = selected_box.transform_dict["translate_transform"]
+        scale_transform = selected_box.transform_dict["scale_transform"]
+
+        print("translate:")
+        print(translate_transform.get_matrix())
+
+        print("rotate:")
+        print(rotate_transform.get_matrix())
+
+        print("scale:")
+        print(scale_transform.get_matrix())
+
+        origin = torch.zeros((1, 1, 3))
+
+        print(
+            "translated origin:",
+            translate_transform.transform_points(origin)
+        )
+
+        print(
+            "rotated origin:",
+            rotate_transform.transform_points(origin)
+        )
+
+        print(
+            "scaled origin:",
+            scale_transform.transform_points(origin)
+        )
+
+        print("obb centroid")
+        print(obb_center)
+
+        zero = torch.zeros((1, 1, 3))
+        composed = scale_transform.compose(rotate_transform).compose(translate_transform)
+        world_origin = composed.transform_points(zero).squeeze().numpy()
+
+        print("CAD origin mapped into world space:", world_origin)
+        print("obb_data centroid:                 ", obb_center)
+        print("difference:                        ", world_origin - obb_center)
+
+        R_cad = rotate_transform.get_matrix()[0, :3, :3].numpy()
+        print("rotate_transform 3x3:\n", R_cad)
+        print("obb_axes:\n", obb_axes)
 
         # ============================================================
-        # 5. FILTERING & SHARED NORMALIZATION
+        # 5. FILTERING
         # ============================================================
+
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(local_pts)
 
         pcd = pcd.voxel_down_sample(voxel_size=0.005)
 
-        final_pts_local = np.asarray(pcd.points)
+        filtered_pts = np.asarray(pcd.points)
 
-        # light trimming only (outlier suppression, not shape destruction)
-        final_centroid = final_pts_local.mean(axis=0)
-        dist = np.linalg.norm(final_pts_local - final_centroid, axis=1)
+        centroid = filtered_pts.mean(axis=0)
+        dist = np.linalg.norm(filtered_pts - centroid, axis=1)
 
-        # only remove extreme outliers (very safe)
         threshold = np.percentile(dist, 99.5)
-        final_pts_local = final_pts_local[dist < threshold]
+        filtered_pts = filtered_pts[dist < threshold]
 
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(final_pts_local)
-        _, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-        clean_pts_centered = final_pts_local[ind]
+        pcd.points = o3d.utility.Vector3dVector(filtered_pts)
 
-        # Guard against empty or too small point clouds after filtering
-        if len(clean_pts_centered) < 500:
+        _, ind = pcd.remove_statistical_outlier(
+            nb_neighbors=20,
+            std_ratio=2.0
+        )
+
+        filtered_pts = filtered_pts[ind]
+
+        if len(filtered_pts) < 500:
             return None
 
-        clean_pts_centered -= clean_pts_centered.mean(axis=0)
+        print("\n========== OBB DEBUG ==========")
 
-        bbox_min = clean_pts_centered.min(axis=0)
-        bbox_max = clean_pts_centered.max(axis=0)
+        print("Before OBB:")
+        print("count:", len(pts_world_all))
+        print("extent:", np.ptp(pts_world_all, axis=0))
 
-        observed_extent = np.max(bbox_max - bbox_min)
+
+        print("After OBB:")
+        print("count:", len(filtered_pts))
+        print("extent:", np.ptp(filtered_pts, axis=0))
+
+        obb_ratio = len(filtered_pts) / len(pts_world_all)
+
+        print(
+            "OBB retention ratio:",
+            obb_ratio
+        )
         
-        # Guard against degenerate cases where the observed extent is too small
-        if observed_extent < 1e-6:
-            print("⚠️ Degenerate reconstruction")
-            return None
+        # ============================================================
+        # 6. NORMALIZATION -- unaffected by rotation, box scale is fine as-is
+        # ============================================================
+        scale = np.max(np.asarray(obb_data["axesLengths"], dtype=np.float64))
+        clean_pts_canonical = filtered_pts / (scale + 1e-8) * 0.9
 
-        clean_pts_canonical = clean_pts_centered / (observed_extent + 1e-8) * 0.9
+        print("Partial extent:", np.ptp(clean_pts_canonical, axis=0))
+        print("Partial mean:", clean_pts_canonical.mean(axis=0))
 
         # ============================================================
-        # 6. DINO FEATURES (project canonical points back into RGB frame).
+        # 7. DINO FEATURES
         # ============================================================
-        # Project canonical points back into aligned world space for pixel lookup.
-        clean_pts_world_actual = clean_pts_centered + world_centroid
-        
+        pts_t = torch.from_numpy(filtered_pts).float().unsqueeze(0)
+        cad_native_pt = rotate_transform.transform_points(pts_t).squeeze(0).cpu().numpy()
+        clean_pts_world_actual = cad_native_pt @ COORD_FIX.T + translation_anchor
+
         w2c_best = np.linalg.inv(best_c2w)
         uv_continuous = project_world_to_pixel(clean_pts_world_actual, w2c_best, best_K)
         d_feats = get_dino_features_bilinear(self.dino, best_rgb, uv_continuous)
 
         # ============================================================
-        # 7. UTONIA FEATURES & FUSION
+        # 8. UTONIA FEATURES & FUSION
         # ============================================================
         # Extract Utonia point features on the canonical object shape.
         s_pts, u_feats, sampled_indices = self._run_utonia_on_points(clean_pts_canonical, num_pts)
@@ -562,7 +669,7 @@ class SceneDataEngine:
             d_feats
         ])
 
-        print("FINAL CLOUD SIZE:", len(clean_pts_centered))
+        print("FINAL CLOUD SIZE:", len(clean_pts_world_actual))
         print("FINAL CANONICAL SIZE:", len(clean_pts_canonical))
 
         return s_pts, u_feats, d_feats, fused_pointwise

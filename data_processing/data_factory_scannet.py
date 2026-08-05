@@ -328,6 +328,9 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
         print(f"\n📋 Scene '{scene_id}' contains {len(annotation_obj.obj_annotation_list)} total annotated objects.")
 
         for obj in annotation_obj.obj_annotation_list:
+            print("obj.transform3d")
+            print(obj.transform3d.get_matrix())
+
             raw_category = str(getattr(obj, 'category_label', getattr(obj, 'scannet_category_label', ''))).lower()
             obj_id = str(getattr(obj, 'object_id', 'unknown'))
 
@@ -376,7 +379,8 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
             try:
                 s_pts, u_feats, d_feats, fused_pointwise = engine.get_multi_view_tsdf_object(
                     sweep_frames, 
-                    T_obj, 
+                    obj,
+                    T_obj,
                     obb_data, 
                     num_pts=2048 
                 )
