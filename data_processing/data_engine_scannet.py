@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import trimesh
 import open3d as o3d
-from scipy.spatial import KDTree
+from scipy.spatial import cKDTree as KDTree
 
 
 def _matrix_to_intrinsics(raw_k):
@@ -57,6 +57,8 @@ class SceneDataEngine:
         self.sam = sam
         self.dino = dino
         self.uto = utonia
+        # Cache device for torch to avoid re-evaluating repeatedly
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         with open(paths["json"], "r") as f:
             self.meta = json.load(f)
 
@@ -93,8 +95,7 @@ class SceneDataEngine:
             idx = np.random.choice(len(pts), num_pts, replace=False).astype(np.int64)
         pts_sampled = pts[idx]
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        u_input = torch.from_numpy(pts_sampled).float().unsqueeze(0).to(device)
+        u_input = torch.from_numpy(pts_sampled).float().unsqueeze(0).to(self.device)
         with torch.no_grad():
             outputs = self.uto(u_input)
 
@@ -119,8 +120,10 @@ class SceneDataEngine:
         if len(sparse_coords) < 4:
             return pts_sampled, np.zeros((len(pts_sampled), 32), dtype=np.float32), idx
 
+        # use cKDTree (fast C implementation) for nearest-neighbor lookup
         tree = KDTree(sparse_coords)
-        distances, indices = tree.query(pts_sampled, k=min(4, len(sparse_coords)))
+        k = min(4, len(sparse_coords))
+        distances, indices = tree.query(pts_sampled, k=k)
         weights = 1.0 / (distances + 1e-8)
         weights /= np.sum(weights, axis=1, keepdims=True)
         point_feats = np.asarray(point_feats)
@@ -148,7 +151,7 @@ class SceneDataEngine:
         gt_min = vertices.min(axis=0)
         gt_max = vertices.max(axis=0)
 
-        gt_pts = mesh.sample(16384)
+        gt_pts = mesh.sample(8192)
 
         # 1. Center the CAD points at the origin
         gt_center = (gt_max + gt_min) / 2.0
@@ -271,19 +274,12 @@ class SceneDataEngine:
             world_corners = local_corners @ obb_axes.T + obb_center
 
             # 2. Project all 8 corners into the 2D image plane
-            pixels = []
-            for pt in world_corners:
-                # Transform to camera space first to check Z
-                pt_h = np.append(pt, 1.0)
-                cam_pt = w2c @ pt_h
-                if cam_pt[2] > 0.05:  # Only project points safely in front of the lens
-                    px = project_world_to_pixel(pt, w2c, K)
-                    pixels.append(np.array(px).flatten())
-
-            if len(pixels) < 4:
+            # Vectorized projection of OBB corners: faster than looping
+            pts_cam_corners = project_world_to_camera(world_corners, w2c)
+            in_front = pts_cam_corners[:, 2] > 0.05
+            if np.count_nonzero(in_front) < 4:
                 continue
-
-            pixels = np.array(pixels, dtype=np.float32)
+            pixels = project_to_pixel(pts_cam_corners[in_front], K).astype(np.float32)
             img_h, img_w = rgb.shape[:2]
             pad = 0.1
 
@@ -538,7 +534,8 @@ class SceneDataEngine:
         clean_pts_world_actual = cad_native_pt @ COORD_FIX.T + translation_anchor
 
         w2c_best = np.linalg.inv(best_c2w)
-        uv_continuous = project_world_to_pixel(clean_pts_world_actual, w2c_best, best_K)
+        pts_cam_best = project_world_to_camera(clean_pts_world_actual, w2c_best)
+        uv_continuous = project_to_pixel(pts_cam_best, best_K)
         d_feats = get_dino_features_bilinear(self.dino, best_rgb, uv_continuous)
 
         # ============================================================

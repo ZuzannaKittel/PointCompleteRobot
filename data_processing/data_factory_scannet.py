@@ -236,16 +236,14 @@ def find_multi_view_frames_vectorized(world_center, camera_json_data, scene_path
     return [valid_frames[i][0] for i in indices]
 
 
-def generate_universal_dataset(base_data_dir, output_dir, target_categories, checkpoint_path):
+def generate_universal_dataset(base_data_dir, output_dir, target_categories, checkpoint_path, verbose=True):
     PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     absolute_output_dir = os.path.join(PROJECT_ROOT, output_dir, "train")
     os.makedirs(absolute_output_dir, exist_ok=True)
 
-    existing_files = glob.glob(
-        os.path.join(absolute_output_dir, "pair_*.pt")
-    )
+    # Precompute lowercase target substrings for faster matching
+    target_categories_lower = [tc.lower() for tc in target_categories]
 
-    # --- Track unique object pairs instead of scenes ---
     existing_files = glob.glob(os.path.join(absolute_output_dir, "pair_*.pt"))
     existing_ids = []
     processed_pairs = set()  # Tracks (scene_id, obj_id)
@@ -266,15 +264,20 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
             print(f"⚠️ Could not parse filename {f}: {e}")
 
     pair_counter = max(existing_ids) + 1 if existing_ids else 0
-    print(f"🚀 Found {len(processed_pairs)} completed object pairs on disk.")
-    print(f"📈 Next pair will start with index: {pair_counter}")
-
-    print("🤖 Initializing Foundation Backbones...")
+    if verbose:
+        print(f"🚀 Found {len(processed_pairs)} completed object pairs on disk.")
+        print(f"📈 Next pair will start with index: {pair_counter}")
+        print("🤖 Initializing Foundation Backbones...")
     dino = init_dino()
     uto = init_utonia(ckpt_path=checkpoint_path)
     sam = init_sam(os.path.join(PROJECT_ROOT, "checkpoints/weights/sam_vit_h_4b8939.pth"))
 
-    scene_paths = glob.glob(os.path.join(PROJECT_ROOT, base_data_dir, "data/data/*"))
+    # use os.scandir (faster) to list scene directories
+    scene_data_dir = os.path.join(PROJECT_ROOT, base_data_dir, "data/data")
+    if os.path.isdir(scene_data_dir):
+        scene_paths = [os.path.join(scene_data_dir, d.name) for d in os.scandir(scene_data_dir) if d.is_dir()]
+    else:
+        scene_paths = []
     #pair_counter = 0
 
     for scene_path in tqdm(scene_paths, desc="Processing Scenes"):
@@ -301,9 +304,10 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
         }
 
         # --- FOR DEBUGGING ---
-        print(f"\nDEBUG checking scene: {scene_id}")
-        print(f" -> Looking for JSON at: {paths['json']} (Exists: {os.path.exists(paths['json'])})")
-        print(f" -> Looking for PKL at: {paths['pkl']} (Exists: {os.path.exists(paths['pkl'])})")
+        if verbose:
+            print(f"\nDEBUG checking scene: {scene_id}")
+            print(f" -> Looking for JSON at: {paths['json']} (Exists: {os.path.exists(paths['json'])})")
+            print(f" -> Looking for PKL at: {paths['pkl']} (Exists: {os.path.exists(paths['pkl'])})")
 
         if not os.path.exists(paths["pkl"]) or not os.path.exists(paths["json"]): 
             continue
@@ -325,22 +329,25 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
             dino=dino, 
             utonia=uto)
 
-        print(f"\n📋 Scene '{scene_id}' contains {len(annotation_obj.obj_annotation_list)} total annotated objects.")
+        if verbose:
+            print(f"\n📋 Scene '{scene_id}' contains {len(annotation_obj.obj_annotation_list)} total annotated objects.")
 
         for obj in annotation_obj.obj_annotation_list:
-            print("obj.transform3d")
-            print(obj.transform3d.get_matrix())
+            if verbose:
+                print("obj.transform3d")
+                print(obj.transform3d.get_matrix())
 
             raw_category = str(getattr(obj, 'category_label', getattr(obj, 'scannet_category_label', ''))).lower()
             obj_id = str(getattr(obj, 'object_id', 'unknown'))
 
             # --- Skip this specific object if already processed ---
             if (scene_id, obj_id) in processed_pairs:
-                print(f"   ⏭️ Skipping object ID {obj_id} ({raw_category}) in scene {scene_id}: already processed.")
+                if verbose:
+                    print(f"   ⏭️ Skipping object ID {obj_id} ({raw_category}) in scene {scene_id}: already processed.")
                 continue  # Silently bypasses heavy extraction for existing targets
 
             # The loop continues down to your target category check next...
-            if not any(tc in raw_category for tc in target_categories):
+            if not any(tc in raw_category for tc in target_categories_lower):
                 continue
 
             # --- 1. PRE-CALCULATE AND INITIALIZE ---
@@ -352,12 +359,14 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
             world_center = T_obj[3, :3] 
 
             if obb_data is None:
-                print(f"   ↳ ID {obj_id}: ⚠️ OBB missing from scan2cad dict.")
+                if verbose:
+                    print(f"   ↳ ID {obj_id}: ⚠️ OBB missing from scan2cad dict.")
                 continue
             else:
                 world_center = np.array(obb_data['centroid'])
 
-            print(f"\nDEBUG: Processing object ID {obj_id} at {world_center}")
+            if verbose:
+                print(f"\nDEBUG: Processing object ID {obj_id} at {world_center}")
 
             # --- 2. SAMPLING ---
             # GUARD 2: Pass scene_path to ensure we only select frames that actually exist on disk
@@ -370,10 +379,12 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
 
             # GUARD 3: Ensure we have enough real frames to perform a valid TSDF fusion
             if not sweep_frames or len(sweep_frames) < 3:
-                print(f"   ↳ ID {obj_id} ({raw_category}): ⚠️ Skipped - Insufficient valid frames on disk.")
+                if verbose:
+                    print(f"   ↳ ID {obj_id} ({raw_category}): ⚠️ Skipped - Insufficient valid frames on disk.")
                 continue
             else: 
-                print(f"   ↳ ID {obj_id} ({raw_category}): Found {len(sweep_frames)} valid frames on disk: {sweep_frames}")
+                if verbose:
+                    print(f"   ↳ ID {obj_id} ({raw_category}): Found {len(sweep_frames)} valid frames on disk: {sweep_frames}")
 
             # --- 3. EXECUTION ---
             try:
@@ -385,15 +396,17 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
                 )
                 print(f"   ☑️ Partial point cloud extracted with {s_pts.shape[0]} points.")
             except Exception as e:
-                print(f"❌ Extraction failed for ID {obj_id}")
-                #traceback.print_exc()
+                if verbose:
+                    print(f"❌ Extraction failed for ID {obj_id}")
+                    #traceback.print_exc()
                 continue
 
             # Harvest Ground Truth
             #gt_points = engine.get_ground_truth(paths["pkl"], paths["shapenet"], obj_id, raw_category, obb_data)
             gt_points = engine.get_ground_truth(obj, paths["shapenet"], raw_category, obb_data)
             if gt_points is None or len(gt_points) == 0:
-                print(f"      ⚠️ Skipping: ShapeNet CAD model missing.")
+                if verbose:
+                    print(f"      ⚠️ Skipping: ShapeNet CAD model missing.")
                 continue
 
             # Complete package saved as a single .pt file for easy loading in training scripts
@@ -414,9 +427,11 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
             )
             torch.save(data_pair, save_filename)
             pair_counter += 1
-            print(f"      ✅ Saved training package: {os.path.basename(save_filename)}")
+            if verbose:
+                print(f"      ✅ Saved training package: {os.path.basename(save_filename)}")
 
-    print(f"\n🎉 Generation complete! Successfully produced {pair_counter} perfect canonical training pairs.")
+    if verbose:
+        print(f"\n🎉 Generation complete! Successfully produced {pair_counter} perfect canonical training pairs.")
 
 
 if __name__ == "__main__":
@@ -466,5 +481,6 @@ if __name__ == "__main__":
         base_data_dir="data/ScanNetpp", 
         output_dir="data/pairs_scannet", 
         target_categories=TARGETS,
-        checkpoint_path=CKPT_PATH
+        checkpoint_path=CKPT_PATH, 
+        verbose=False  # Set to True for detailed debug output
     )
