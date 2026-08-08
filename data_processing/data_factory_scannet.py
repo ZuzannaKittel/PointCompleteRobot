@@ -123,7 +123,7 @@ def find_multi_view_frames(world_center, camera_json_data, scene_root, num_frame
     return sampled_frames
 
 
-def find_multi_view_frames_vectorized(world_center, camera_json_data, scene_path, num_frames=5):
+def find_multi_view_frames_vectorized(world_center, camera_json_data, scene_path, num_frames=5, fully_extracted_frames=None):
     """ 
     Vectorized version of find_multi_view_frames. 
     This is a critical function that is called for every single object during dataset generation, 
@@ -134,34 +134,28 @@ def find_multi_view_frames_vectorized(world_center, camera_json_data, scene_path
     """
      
     # 1. Identify which frames are ACTUALLY fully extracted on disk
-    rgb_dir = os.path.join(scene_path, "iphone", "rgb")
-    depth_dir = os.path.join(scene_path, "iphone", "depth")
-    
-    if not os.path.exists(rgb_dir) or not os.path.exists(depth_dir):
-        return None
-        
-    # Scan directories once to build a lightning-fast O(1) look-up set of frame IDs
-    try:
-        # Check for both .jpg and .png in the RGB folder!
-        available_rgb = {
-            int(f.split('_')[1].split('.')[0]) 
-            for f in os.listdir(rgb_dir) 
-            if f.startswith("frame_") and (f.endswith(".png") or f.endswith(".jpg"))
-        }
-        
-        # Depth maps are basically always .png
-        available_depth = {
-            int(f.split('_')[1].split('.')[0]) 
-            for f in os.listdir(depth_dir) 
-            if f.startswith("frame_") and f.endswith(".png")
-        }
-        
-        # A frame must have BOTH RGB and Depth present to be valid
-        fully_extracted_frames = available_rgb.intersection(available_depth)
-        
-    except Exception as e:
-        print(f"   ⚠️ Error parsing disk frames: {e}")
-        return None
+    # and store them in a set for fast membership testing
+    if fully_extracted_frames is None:
+        # fallback path — kept so the function still works standalone
+        rgb_dir = os.path.join(scene_path, "iphone", "rgb")
+        depth_dir = os.path.join(scene_path, "iphone", "depth")
+        if not os.path.exists(rgb_dir) or not os.path.exists(depth_dir):
+            return None
+        try:
+            available_rgb = {
+                int(f.split('_')[1].split('.')[0])
+                for f in os.listdir(rgb_dir)
+                if f.startswith("frame_") and (f.endswith(".png") or f.endswith(".jpg"))
+            }
+            available_depth = {
+                int(f.split('_')[1].split('.')[0])
+                for f in os.listdir(depth_dir)
+                if f.startswith("frame_") and f.endswith(".png")
+            }
+            fully_extracted_frames = available_rgb.intersection(available_depth)
+        except Exception as e:
+            print(f"   ⚠️ Error parsing disk frames: {e}")
+            return None
 
     # 2. Filter JSON keys: Only keep frames that are valid in metadata AND exist on disk
     frame_keys = []
@@ -286,6 +280,33 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
 
         scene_id = os.path.basename(scene_path)
 
+        # Quick-skip: if any output file already exists for this scene, skip whole scene
+        existing_scene_files = glob.glob(os.path.join(absolute_output_dir, f"*_{scene_id}_*.pt"))
+        if len(existing_scene_files) > 0:
+            if verbose:
+                print(f"   ⏭️⏭️⏭️ Skipping scene {scene_id}: found {len(existing_scene_files)} existing output files.")
+            continue
+
+        """# Quick-skipv2: skip the whole scene only if any existing output file for this scene
+        # already has a pair index at or above the threshold used for the resumed run.
+        existing_scene_files = glob.glob(os.path.join(absolute_output_dir, f"*_{scene_id}_*.pt"))
+        if existing_scene_files:
+            has_high_pair = False
+            for file_path in existing_scene_files:
+                try:
+                    file_name = os.path.basename(file_path)
+                    pair_id = int(file_name.split("_")[1])
+                    if pair_id >= 1750:
+                        has_high_pair = True
+                        break
+                except (ValueError, IndexError):
+                    continue
+
+            if has_high_pair:
+                if verbose:
+                    print(f"   ⏭️⏭️⏭️ Skipping scene {scene_id}: found output files with pair index >= 1750.")
+                continue"""
+
         # Do not skip full scenes anymore; process all scenes regardless of previous runs 
         # and rely on the processed_pairs set to skip individual objects instead.
         """if scene_id in processed_scenes:
@@ -295,6 +316,25 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
         # This skips the ghost folders (which does not contain "iphone" folder) 
         # instantly before printing any debug statements
         if not os.path.isdir(os.path.join(scene_path, "iphone")):
+            continue
+
+        # NEW: scan the frame directories once per scene
+        rgb_dir = os.path.join(scene_path, "iphone", "rgb")
+        depth_dir = os.path.join(scene_path, "iphone", "depth")
+        try:
+            available_rgb = {
+                int(f.split('_')[1].split('.')[0])
+                for f in os.listdir(rgb_dir)
+                if f.startswith("frame_") and (f.endswith(".png") or f.endswith(".jpg"))
+            }
+            available_depth = {
+                int(f.split('_')[1].split('.')[0])
+                for f in os.listdir(depth_dir)
+                if f.startswith("frame_") and f.endswith(".png")
+            }
+            fully_extracted_frames = available_rgb.intersection(available_depth)
+        except Exception as e:
+            print(f"   ⚠️ Error parsing disk frames for scene {scene_id}: {e}")
             continue
 
         paths = {
@@ -309,6 +349,7 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
             print(f" -> Looking for JSON at: {paths['json']} (Exists: {os.path.exists(paths['json'])})")
             print(f" -> Looking for PKL at: {paths['pkl']} (Exists: {os.path.exists(paths['pkl'])})")
 
+        # Skip the scene if either the JSON or PKL file is missing
         if not os.path.exists(paths["pkl"]) or not os.path.exists(paths["json"]): 
             continue
 
@@ -374,7 +415,8 @@ def generate_universal_dataset(base_data_dir, output_dir, target_categories, che
                 world_center, 
                 camera_json_data, 
                 scene_path=scene_path, 
-                num_frames=5
+                num_frames=5,
+                fully_extracted_frames=fully_extracted_frames
             )
 
             # GUARD 3: Ensure we have enough real frames to perform a valid TSDF fusion
@@ -482,5 +524,5 @@ if __name__ == "__main__":
         output_dir="data/pairs_scannet", 
         target_categories=TARGETS,
         checkpoint_path=CKPT_PATH, 
-        verbose=False  # Set to True for detailed debug output
+        verbose=True  #Set to True for detailed debug output
     )

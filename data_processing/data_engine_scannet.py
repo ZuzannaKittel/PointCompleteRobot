@@ -307,9 +307,9 @@ class SceneDataEngine:
             if mask_2d.shape != depth.shape:
                 mask_2d = cv2.resize(mask_2d.astype(np.uint8), (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
 
-            semantic_valid = (mask_2d > 0) & (depth > 0.1) & (depth < 4.5)
+            semantic_valid = (mask_2d > 0) & (depth > 0.1) & (depth < 6.0) # increased to 6.0m to allow for more distant points in larger scenes
 
-            if np.count_nonzero(semantic_valid) < 500:
+            if np.count_nonzero(semantic_valid) < 300: # decreased to 300 to allow for more frames to pass the filter, especially in sparse scenes
                 continue
 
             z_cam = depth[semantic_valid]
@@ -340,7 +340,7 @@ class SceneDataEngine:
 
             # Skip frames where the OBB crop removes too much geometry.
             frame_pass_rate = len(pts_cropped) / max(len(pts_world), 1)
-            if frame_pass_rate < 0.3:
+            if frame_pass_rate < 0.2:  # decreased to 0.2 to allow for more frames to pass the filter, especially in cases where the object is partially occluded
                 print(f"  ⚠️ frame {frame_key}: only {frame_pass_rate:.1%} of backprojected points "
                     f"fall inside the OBB -- likely mask leakage, skipping")
                 continue
@@ -391,6 +391,7 @@ class SceneDataEngine:
         # ============================================================
         # 3. CHECK FUSION
         # ============================================================
+        # Guard against too few frames to perform a valid TSDF fusion.
         if len(frame_clouds) < 2:
             return None
 
@@ -399,7 +400,7 @@ class SceneDataEngine:
         # ------------------------------------------------------------------
         frame_clouds.sort(key=lambda x: x["score"], reverse=True)
 
-        max_frames = 12
+        max_frames = 6 # decreased to 6 for more robust material for the TSDF fusion and filtering, while still keeping it manageable
         selected_frames = frame_clouds[:max_frames]
 
         print("Selected frames:")
@@ -442,12 +443,12 @@ class SceneDataEngine:
             print("⚠️ Empty TSDF mesh")
             return None
         
-        pcd = mesh.sample_points_uniformly(number_of_points=12000)
+        pcd = mesh.sample_points_uniformly(number_of_points=6000) # decrease to 6000 as 12000 was too many and caused memory issues in some cases
 
         pts_world_all = np.asarray(pcd.points)
 
         # Guard against empty or too small point clouds after TSDF fusion
-        if len(pts_world_all) < 500:
+        if len(pts_world_all) < 100:
             return None
 
         # Crop with OBB again to remove any stray points outside the object
@@ -455,7 +456,7 @@ class SceneDataEngine:
         pts_world_all = pts_world_all[mask]
 
         # Guard against empty or too small point clouds after OBB cropping
-        if len(pts_world_all) < 500:
+        if len(pts_world_all) < 80:
             return None
 
         # ============================================================
@@ -517,7 +518,7 @@ class SceneDataEngine:
 
         filtered_pts = filtered_pts[ind]
 
-        if len(filtered_pts) < 500:
+        if len(filtered_pts) < 80:
             return None
 
         # ============================================================
@@ -549,5 +550,9 @@ class SceneDataEngine:
             (u_feats.detach().cpu().numpy() if hasattr(u_feats, 'detach') else u_feats),
             d_feats
         ])
+
+        print(f"Utonia features shape: {u_feats.shape}")
+        print(f"DINO features shape: {d_feats.shape}")
+        print(f"Fused features shape: {fused_pointwise.shape}")
 
         return s_pts, u_feats, d_feats, fused_pointwise
