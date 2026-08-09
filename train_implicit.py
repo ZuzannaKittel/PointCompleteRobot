@@ -10,6 +10,7 @@ import trimesh
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from configs.run_config import get_run_dir, get_run_name
+from configs.ablations import ABLATIONS, ABLATION_DESCRIPTIONS
 from models.implicit_network import ImplicitDecoderBasic, MultiModalFeatureEncoder
 from models.dinocomplete import DinoCompleteBaselineEncoder
 from utils.evaluation import evaluate_test_set
@@ -32,8 +33,25 @@ if __name__ == "__main__":
     # ==========================================================
     
     # TODO: Select the ARCHITECTURE
-    #ARCHITECTURE = "dinocomplete"
-    ARCHITECTURE = "ours"
+    ARCHITECTURE = "dinocomplete"
+    #ARCHITECTURE = "ours"
+
+    # TODO: Select the ABLATION CONFIGURATION   
+    ABLATION = "baseline"
+    #ABLATION = "hidden384"
+    #ABLATION = "hidden384_fourier"
+    #ABLATION = "hidden384_fourier_residual"
+
+    if ARCHITECTURE == "ours":
+        if ABLATION not in ABLATIONS:
+            raise ValueError(
+                f"Unknown ablation '{ABLATION}'. "
+                f"Available: {list(ABLATIONS.keys())}"
+            )
+        ablation_config = ABLATIONS[ABLATION]
+
+    else:
+        ablation_config = None
 
     MODE = "scannet_train"
 
@@ -45,7 +63,7 @@ if __name__ == "__main__":
     RUN_NAME = "scannet_train"
 
     if ARCHITECTURE == "ours":
-        RUN_NAME += "_ours"
+        RUN_NAME += f"_ours_{ABLATION}"
     else:
         RUN_NAME += "_dinocomplete"
 
@@ -67,6 +85,10 @@ if __name__ == "__main__":
 
     print(f"Training mode : {MODE}")
     print(f"Architecture  : {ARCHITECTURE}")
+    if ARCHITECTURE == "ours":
+        print(f"Ablation      : {ABLATION}")
+        print(f"Description   : {ABLATION_DESCRIPTIONS[ABLATION]}")
+        print(f"Decoder config: {ablation_config}")
     print(f"Checkpoint    : {LOAD_MODEL}")
     print(f"Dataset       : {DATA_DIR}")
     print(f"Learning rate : {LR}")
@@ -122,10 +144,21 @@ if __name__ == "__main__":
     elif ARCHITECTURE == "dinocomplete":
         encoder = DinoCompleteBaselineEncoder().to(device)
 
-    decoder = ImplicitDecoderBasic(
-        latent_dim=1024,
-        hidden_dim=256
-    ).to(device)
+    if ARCHITECTURE == "ours":
+
+        decoder = ImplicitDecoderBasic(
+            latent_dim=1024,
+            **ablation_config,
+        ).to(device)
+
+    elif ARCHITECTURE == "dinocomplete":
+
+        decoder = ImplicitDecoderBasic(
+            latent_dim=1024,
+            hidden_dim=256,
+            use_fourier=False,
+            use_residual=False,
+        ).to(device)
 
     # Calculate total number of parameters in the model
     num_params = (
@@ -225,32 +258,53 @@ if __name__ == "__main__":
     epochs = 150
     
     # ==========================================
-    # TRAINING CONFIGURATION
+    # MODEL SUMMARY
     # ==========================================
+
     with open(f"{RUN_DIR}/model_summary.txt", "w") as f:
+
         f.write(f"Architecture: {ARCHITECTURE}\n")
 
         if ARCHITECTURE == "ours":
+            f.write(f"Ablation: {ABLATION}\n")
+            f.write(f"Description: {ABLATION_DESCRIPTIONS[ABLATION]}\n")
             f.write(f"Input feature dimension: {detected_dim}\n")
-            f.write("Input projection: input_dim -> 1024\n")
-            f.write("Encoder latent: 512\n")
-            f.write("Global latent (max+mean): 1024\n")
-            f.write("Decoder latent: 1024\n")
-            f.write("Hidden dim: 256\n")
-            f.write("Batch size: 32\n")
-            f.write(f"Epochs: {epochs}\n")
-            f.write("Optimizer: AdamW\n")
-            f.write(f"Learning rate: {LR}\n")
-            f.write(f"Parameters: {num_params:,}\n")
+            f.write("Encoder: Utonia/DINO -> 1024 -> 256 Transformer -> 512\n")
+            f.write("Global latent: mean + max pooling -> 1024\n")
+            f.write(f"Decoder hidden dim: {ablation_config['hidden_dim']}\n")
+            f.write(
+                f"Fourier encoding: "
+                f"{ablation_config.get('use_fourier', False)}\n"
+            )
+            f.write(
+                f"Residual decoder: "
+                f"{ablation_config.get('use_residual', False)}\n"
+            )
+
+            if ablation_config.get("use_fourier", False):
+                f.write(
+                    f"Fourier bands: "
+                    f"{ablation_config.get('num_fourier_bands', 10)}\n"
+                )
+
+            if ablation_config.get("use_residual", False):
+                f.write(
+                    f"Residual blocks: "
+                    f"{ablation_config.get('num_residual_blocks', 4)}\n"
+                )
+
         else:
             f.write("Geometry encoder: XYZ\n")
             f.write("Semantic encoder: DINO\n")
             f.write("Context: Shared Transformer\n")
             f.write("Pooling: Attention\n")
-            f.write(f"Epochs: {epochs}\n")
-            f.write("Optimizer: AdamW\n")
-            f.write(f"Learning rate: {LR}\n")
-            f.write(f"Parameters: {num_params:,}\n")
+
+        f.write(f"Batch size: 32\n")
+        f.write(f"Epochs: {epochs}\n")
+        f.write(f"Optimizer: AdamW\n")
+        f.write(f"Learning rate: {LR}\n")
+        f.write(f"Weight decay: {WD}\n")
+        f.write(f"Parameters: {num_params:,}\n")
 
     first_batch = next(iter(train_loader))
 
