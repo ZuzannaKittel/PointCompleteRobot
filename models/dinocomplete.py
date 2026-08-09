@@ -80,18 +80,20 @@ class AttentionPooling(nn.Module):
 
 class DinoCompleteBaselineEncoder(nn.Module):
     """
-    Point-based DinoComplete proxy.
+    Point-based DinoComplete-inspired encoder.
 
-    Geometry:
-        XYZ
+    This implementation preserves the principal ideas of
+    DinoComplete:
 
-    Semantics:
-        DINO only
+        • separate geometry and semantic branches;
+        • transformer-based contextual reasoning;
+        • feature fusion;
+        • global representation learning.
 
-    Design goal:
-        Keep the paper's separation of geometry and semantics,
-        plus contextual refinement and residual fusion,
-        while staying compatible with your point-based pipeline.
+    Unlike the original DinoComplete architecture, the model
+    operates directly on point clouds and produces a global
+    latent representation that is subsequently used by an
+    implicit occupancy decoder.
     """
 
     def __init__(self):
@@ -147,3 +149,74 @@ class DinoCompleteBaselineEncoder(nn.Module):
         latent = F.normalize(latent, dim=-1)
 
         return latent
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class DinoInspiredDecoder(nn.Module):
+    """
+    Simple implicit decoder for the DinoComplete-inspired baseline.
+
+    Deliberately excludes:
+
+        - Fourier features
+        - residual blocks
+        - latent reinjection
+        - skip connections
+
+    so that the proposed architecture can be evaluated fairly.
+    """
+
+    def __init__(
+        self,
+        latent_dim=1024,
+        coord_dim=128,
+        hidden_dim=512,
+        dropout=0.1,
+    ):
+        super().__init__()
+
+        self.coord_encoder = nn.Sequential(
+            nn.Linear(3, coord_dim),
+            nn.LayerNorm(coord_dim),
+            nn.GELU(),
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(coord_dim + latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, query_coords, latent):
+
+        batch_size, num_queries, _ = query_coords.shape
+
+        coord_features = self.coord_encoder(query_coords)
+
+        latent = latent.unsqueeze(1)
+        latent = latent.expand(-1, num_queries, -1)
+
+        features = torch.cat(
+            [coord_features, latent],
+            dim=-1,
+        )
+
+        logits = self.decoder(features)
+
+        return logits.squeeze(-1)

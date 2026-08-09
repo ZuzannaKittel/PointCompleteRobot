@@ -27,7 +27,7 @@ class MultiModalFeatureEncoder(nn.Module):
         self.input_feat_dim = input_feat_dim
         if input_feat_dim not in (1024, 1408):
             raise ValueError(f"Unsupported feature dimension: {input_feat_dim}")
-        
+
         self.latent_dim = latent_dim
 
         # Normalize fused multi-modal descriptors before relational reasoning.
@@ -36,7 +36,7 @@ class MultiModalFeatureEncoder(nn.Module):
         if input_feat_dim == 1024:
             # ShapeNet pretraining
             self.utonia_projection = nn.Sequential(
-                nn.Linear(1024,1024),
+                nn.Linear(1024, 1024),
                 nn.GELU(),
             )
             self.dino_projection = None
@@ -44,12 +44,12 @@ class MultiModalFeatureEncoder(nn.Module):
         elif input_feat_dim == 1408:
             # ScanNet++ finetuning
             self.utonia_projection = nn.Sequential(
-                nn.Linear(1024,1024),
+                nn.Linear(1024, 1024),
                 nn.GELU(),
             )
 
             self.dino_projection = nn.Sequential(
-                nn.Linear(384,1024),
+                nn.Linear(384, 1024),
                 nn.GELU(),
             )
 
@@ -72,7 +72,6 @@ class MultiModalFeatureEncoder(nn.Module):
         # with the remaining visible geometry, allowing the network to capture
         # long-range structural relationships.
         self.transformer = nn.TransformerEncoder(
-
             nn.TransformerEncoderLayer(
                 d_model=256,
                 nhead=8,
@@ -82,7 +81,6 @@ class MultiModalFeatureEncoder(nn.Module):
                 batch_first=True,
                 norm_first=True,
             ),
-
             num_layers=1,
         )
 
@@ -91,12 +89,10 @@ class MultiModalFeatureEncoder(nn.Module):
         # Refine contextualized descriptors and expand them into the
         # final point-wise embedding used for global pooling.
         self.encoder = nn.Sequential(
-
-            nn.Linear(256,512),
+            nn.Linear(256, 512),
             nn.LayerNorm(512),
             nn.GELU(),
-
-            nn.Linear(512,512),
+            nn.Linear(512, 512),
             nn.LayerNorm(512),
             nn.GELU(),
         )
@@ -104,8 +100,7 @@ class MultiModalFeatureEncoder(nn.Module):
         self.output_dim = latent_dim * 2
 
     def forward(self, partial_feats):
-
-        # [B,N,input_dim]
+        # [B, N, input_dim]
         if self.input_feat_dim == 1024:
             x = self.utonia_projection(partial_feats)
         else:
@@ -116,7 +111,6 @@ class MultiModalFeatureEncoder(nn.Module):
             dino = self.dino_projection(dino)
 
             x = torch.cat((utonia, dino), dim=-1)
-
             x = self.feature_fusion(x)
 
         # Normalize fused descriptors.
@@ -137,7 +131,7 @@ class MultiModalFeatureEncoder(nn.Module):
         # local point information alongside contextual features.
         x = x + residual
 
-        # Help reduce overfitting
+        # Help reduce overfitting.
         x = self.transformer_dropout(x)
 
         # Refine the contextualized point descriptors after attention.
@@ -149,12 +143,53 @@ class MultiModalFeatureEncoder(nn.Module):
         max_pool = x.max(dim=1).values
 
         latent = torch.cat((mean_pool, max_pool), dim=-1)
-
         return latent
 
-class ResidualBlock(nn.Module):
 
-    def __init__(self, hidden_dim):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FourierEncoding(nn.Module):
+    """
+    Fourier positional encoding for continuous 3D coordinates.
+
+    Input:
+        [B, Q, 3]
+
+    Output:
+        [B, Q, 3 + 2 * 3 * num_bands]
+
+    For num_bands=10:
+        3 + 2*3*10 = 63 dimensions.
+    """
+
+    def __init__(self, num_bands=10):
+        super().__init__()
+
+        frequencies = (
+            2.0 ** torch.arange(num_bands, dtype=torch.float32)
+        ) * torch.pi
+
+        self.register_buffer("freq", frequencies)
+
+    def forward(self, x):
+        outputs = [x]
+
+        for f in self.freq:
+            outputs.append(torch.sin(f * x))
+            outputs.append(torch.cos(f * x))
+
+        return torch.cat(outputs, dim=-1)
+
+
+class ResidualBlock(nn.Module):
+    """
+    Residual MLP block used in the final ablation stage.
+    """
+
+    def __init__(self, hidden_dim, dropout=0.1):
         super().__init__()
 
         self.fc1 = nn.Linear(hidden_dim, hidden_dim)
@@ -163,10 +198,9 @@ class ResidualBlock(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
 
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-
         residual = x
 
         x = self.fc1(x)
@@ -181,127 +215,156 @@ class ResidualBlock(nn.Module):
 
         return F.gelu(x)
 
-class FourierEncoding(nn.Module):
-    """
-    Fourier positional encoding for continuous 3D coordinates.
-
-    Input:
-        [B, Q, 3]
-
-    Output:
-        [B, Q, 3 + 2 * 3 * num_bands]
-    """
-
-    def __init__(self, num_bands=10):
-        super().__init__()
-
-        frequencies = (2.0 ** torch.arange(num_bands, dtype=torch.float32)) * torch.pi
-        self.register_buffer("freq", frequencies)
-
-    def forward(self, x):
-
-        out = [x]
-
-        for f in self.freq:
-            out.append(torch.sin(f * x))
-            out.append(torch.cos(f * x))
-
-        return torch.cat(out, dim=-1)
-
 
 class ImplicitDecoderBasic(nn.Module):
     """
-    Implicit occupancy decoder.
+    Configurable implicit occupancy decoder.
 
-    The decoder predicts the occupancy probability of arbitrary 3D query
-    coordinates conditioned on the global latent shape representation.
-    A second latent injection is used midway through the network to
-    reinforce global shape information during occupancy prediction.
+    Ablation stages:
 
-    --- ABLATION study aka EXPERIMENTS ---
-        a) change hidden_dim to 384
-        b) Fourier positional encoding
-        c) residual blocks
+        1. Baseline
+           hidden_dim=256
+           Fourier=False
+           Residual=False
+
+        2. Baseline + hidden_dim=384
+           hidden_dim=384
+           Fourier=False
+           Residual=False
+
+        3. Baseline + hidden_dim=384 + Fourier
+           hidden_dim=384
+           Fourier=True
+           Residual=False
+
+        4. Baseline + hidden_dim=384 + Fourier + Residual
+           hidden_dim=384
+           Fourier=True
+           Residual=True
     """
 
-    def __init__(self, latent_dim=1024, hidden_dim=384):
+    def __init__(
+        self,
+        latent_dim=1024,
+        hidden_dim=256,
+        use_fourier=False,
+        use_residual=False,
+        num_fourier_bands=10,
+        num_residual_blocks=4,
+        dropout=0.1,
+    ):
         super().__init__()
 
-        num_bands = 10
+        self.hidden_dim = hidden_dim
+        self.use_fourier = use_fourier
+        self.use_residual = use_residual
 
-        # Multi-scale positional encoding of query coordinates.
-        self.positional_encoding = FourierEncoding(num_bands=num_bands)
+        if use_fourier:
+            self.positional_encoding = FourierEncoding(
+                num_bands=num_fourier_bands
+            )
+            coord_dim = 3 + 2 * 3 * num_fourier_bands
+        else:
+            self.positional_encoding = nn.Identity()
+            coord_dim = 3
 
-        coord_dim = 3 + 2 * 3 * num_bands
-
-        # Encode Fourier-enhanced query coordinates.
+        # Coordinate encoder: same structure as the original decoder.
         self.coord_encoder = nn.Sequential(
             nn.Linear(coord_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
             nn.GELU(),
-
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
             nn.GELU(),
         )
 
-        # Initial conditioning on the global latent representation.
-        self.fc1 = nn.Linear(hidden_dim + latent_dim, hidden_dim)
+        if not use_residual:
+            # Original GitHub decoder.
+            self.decoder = nn.Sequential(
+                nn.Linear(hidden_dim + latent_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
 
-        # Residual refinement blocks.
-        self.blocks = nn.ModuleList([
-            ResidualBlock(hidden_dim),
-            ResidualBlock(hidden_dim),
-            ResidualBlock(hidden_dim),
-            ResidualBlock(hidden_dim),
-        ])
+        else:
+            # Residual decoder used in the final ablation.
+            self.fc1 = nn.Linear(
+                hidden_dim + latent_dim,
+                hidden_dim
+            )
 
-        # Midway latent reinjection.
-        self.fc_reinject = nn.Linear(
-            hidden_dim + latent_dim,
-            hidden_dim,
-        )
+            self.blocks = nn.ModuleList([
+                ResidualBlock(
+                    hidden_dim,
+                    dropout=dropout
+                )
+                for _ in range(num_residual_blocks)
+            ])
 
-        self.reinject_dropout = nn.Dropout(0.1)
+            self.fc_reinject = nn.Linear(
+                hidden_dim + latent_dim,
+                hidden_dim
+            )
 
-        # Additional refinement.
-        self.final_block = ResidualBlock(hidden_dim)
+            self.reinject_dropout = nn.Dropout(dropout)
 
-        # Occupancy prediction.
-        self.out = nn.Linear(hidden_dim, 1)
+            self.final_block = ResidualBlock(
+                hidden_dim,
+                dropout=dropout
+            )
 
-        nn.init.normal_(self.out.weight, mean=0.0, std=0.01)
-        nn.init.constant_(self.out.bias, 0.0)
+            self.out = nn.Linear(hidden_dim, 1)
+
+            nn.init.normal_(
+                self.out.weight,
+                mean=0.0,
+                std=0.01
+            )
+            nn.init.constant_(self.out.bias, 0.0)
 
     def forward(self, query_pts, latent_vector):
         _, Q, _ = query_pts.shape
 
-        # Apply Fourier positional encoding before coordinate encoding.
         query_pts = self.positional_encoding(query_pts)
-
-        # Encode Fourier-enhanced query coordinates.
         coord_feats = self.coord_encoder(query_pts)
 
-        # Broadcast the global latent representation to every query point.
-        latent = latent_vector.unsqueeze(1).expand(-1, Q, -1)
+        latent = latent_vector.unsqueeze(1).expand(
+            -1, Q, -1
+        )
 
-        # Initial latent conditioning.
-        x = torch.cat([coord_feats, latent], dim=-1)
-        x = F.gelu(self.fc1(x))
+        if not self.use_residual:
+            # Baseline, hidden_dim, and Fourier experiments.
+            x = torch.cat(
+                [coord_feats, latent],
+                dim=-1
+            )
 
-        # Residual refinement.
-        for block in self.blocks:
-            x = block(x)
+            logits = self.decoder(x)
 
-        # Inject the global shape descriptor again.
-        x = torch.cat([x, latent], dim=-1)
-        x = F.gelu(self.fc_reinject(x))
-        x = self.reinject_dropout(x)
+        else:
+            # Final residual experiment.
+            x = torch.cat(
+                [coord_feats, latent],
+                dim=-1
+            )
 
-        # Final refinement.
-        x = self.final_block(x)
+            x = F.gelu(self.fc1(x))
 
-        # Predict occupancies.
-        logits = self.out(x)
+            for block in self.blocks:
+                x = block(x)
+
+            # Midway latent reinjection.
+            x = torch.cat(
+                [x, latent],
+                dim=-1
+            )
+
+            x = F.gelu(self.fc_reinject(x))
+            x = self.reinject_dropout(x)
+
+            # Final residual refinement.
+            x = self.final_block(x)
+
+            logits = self.out(x)
 
         return logits.squeeze(-1)
