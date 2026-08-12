@@ -1,7 +1,5 @@
-import os
 import torch
 from torch.utils.data import Dataset
-
 
 class ScanNetppImplicitDataset(Dataset):
     def __init__(
@@ -9,14 +7,16 @@ class ScanNetppImplicitDataset(Dataset):
         file_paths,
         num_input_pts=2048,
         num_queries=16384,
-        occupancy_threshold=0.015,
-        boundary_sigma=0.01,
+        occupancy_threshold=0.01,
+        boundary_sigma=0.005,
+        boundary_fraction = 0.25,
     ):
         self.file_paths = file_paths
         self.num_input_pts = num_input_pts
         self.num_queries = num_queries
         self.occupancy_threshold = occupancy_threshold
         self.boundary_sigma = boundary_sigma
+        self.boundary_fraction = boundary_fraction
 
     def __len__(self):
         return len(self.file_paths)
@@ -27,8 +27,15 @@ class ScanNetppImplicitDataset(Dataset):
 
         for start in range(0, query_coords.shape[0], chunk_size):
             q = query_coords[start:start + chunk_size]
-            dists = torch.cdist(q.unsqueeze(0), gt_pts.unsqueeze(0))
-            min_dists.append(dists.min(dim=-1).values.squeeze(0))
+
+            dists = torch.cdist(
+                q.unsqueeze(0),
+                gt_pts.unsqueeze(0),
+            )
+
+            min_dists.append(
+                dists.min(dim=-1).values.squeeze(0)
+            )
 
         return torch.cat(min_dists, dim=0)
 
@@ -41,22 +48,10 @@ class ScanNetppImplicitDataset(Dataset):
 
         gt_pts_world = gt_pts.clone()
 
-        # Normalize both partial and GT into the partial-observation frame.
-        centroid = partial_pts.mean(dim=0, keepdim=True)
-
-        partial_pts = partial_pts - centroid
-        gt_pts = gt_pts - centroid
-
-        # Scale using only the observed partial geometry.
-        bbox = partial_pts.max(dim=0).values - partial_pts.min(dim=0).values
-        max_extent = bbox.max().item()
-
+        # Data generation already provides a shared canonical
+        # coordinate system for partial and GT geometry.
+        centroid = torch.zeros(3, dtype=partial_pts.dtype)
         scale_factor = 1.0
-        if max_extent > 0.4:
-            scale_factor = 0.4 / max_extent
-
-        partial_pts = partial_pts * scale_factor
-        gt_pts = gt_pts * scale_factor
 
         # Keep point-feature correspondence exact.
         if partial_pts.shape[0] >= self.num_input_pts:
@@ -71,14 +66,12 @@ class ScanNetppImplicitDataset(Dataset):
         partial_pts_fixed = partial_pts[indices]
         partial_feats_fixed = partial_feats[indices]
 
-        # Recover the selected partial points in their original coordinates.
-        partial_pts_world = (
-            partial_pts_fixed / scale_factor
-        ) + centroid
+        # Already in canonical coordinates.
+        partial_pts_world = partial_pts_fixed.clone()
 
-        # Generate implicit-field queries.
-        num_uniform = self.num_queries // 2
-        num_boundary = self.num_queries - num_uniform
+        # Generate implicit-field queries based on the boundary_fraction
+        num_boundary = int(self.num_queries * self.boundary_fraction)
+        num_uniform = self.num_queries - num_boundary
 
         # Uniform queries cover the complete normalized scene/object volume.
         q_uniform = torch.rand(num_uniform, 3) - 0.5
@@ -100,8 +93,8 @@ class ScanNetppImplicitDataset(Dataset):
             [q_uniform, q_boundary],
             dim=0,
         )
-
-        # Surface-proximity target.
+        
+        
         min_dists = self._min_distance_to_gt(
             query_coords,
             gt_pts,
@@ -111,47 +104,44 @@ class ScanNetppImplicitDataset(Dataset):
             min_dists < self.occupancy_threshold
         ).float()
 
-        os.makedirs("debug_dataset", exist_ok=True)
-
         # DEBUG: Save the normalized partial and GT point clouds, as well as the query points.
-        def save_ply(filename, pts):
-            pts = pts.cpu().numpy()
-            with open(filename, "w") as f:
-                f.write("ply\n")
-                f.write("format ascii 1.0\n")
-                f.write(f"element vertex {len(pts)}\n")
-                f.write("property float x\n")
-                f.write("property float y\n")
-                f.write("property float z\n")
-                f.write("end_header\n")
-                for p in pts:
-                    f.write(f"{p[0]} {p[1]} {p[2]}\n")
-        save_ply(
-            "debug_dataset/partial_after_preprocessing.ply",
-            partial_pts_fixed
-        )
-        save_ply(
-            "debug_dataset/gt_after_preprocessing.ply",
-            gt_pts
-        )
-        save_ply(
-            "debug_dataset/query_points.ply",
-            query_coords
-        )
-        positive_queries = query_coords[target_surface.bool()]
-        save_ply(
-            "debug_dataset/positive_queries.ply",
-            positive_queries
-        )
-
+        if idx == 0:
+            def save_ply(filename, pts):
+                pts = pts.cpu().numpy()
+                with open(filename, "w") as f:
+                    f.write("ply\n")
+                    f.write("format ascii 1.0\n")
+                    f.write(f"element vertex {len(pts)}\n")
+                    f.write("property float x\n")
+                    f.write("property float y\n")
+                    f.write("property float z\n")
+                    f.write("end_header\n")
+                    for p in pts:
+                        f.write(f"{p[0]} {p[1]} {p[2]}\n")
+            save_ply(
+                "debug_dataset/partial_after_preprocessing.ply",
+                partial_pts_fixed
+            )
+            save_ply(
+                "debug_dataset/gt_after_preprocessing.ply",
+                gt_pts
+            )
+            save_ply(
+                "debug_dataset/query_points.ply",
+                query_coords
+            )
+            positive_queries = query_coords[target_surface.bool()]
+            save_ply(
+                "debug_dataset/positive_queries.ply",
+                positive_queries
+            )
         
-
         return {
             "partial_pts": partial_pts_fixed,
             "partial_feats": partial_feats_fixed,
             "query_coords": query_coords,
             "target_surface": target_surface,
-            "centroid": centroid.squeeze(0),
+            "centroid": centroid,
             "scale_factor": torch.tensor(
                 scale_factor,
                 dtype=torch.float32,
@@ -176,12 +166,12 @@ if __name__ == "__main__":
 
     sample = dataset[0]
 
-    print("Data loaded successfully.")
+    print("\nData loaded successfully.")
     print("Partial:", sample["partial_pts"].shape)
     print("Features:", sample["partial_feats"].shape)
     print("Queries:", sample["query_coords"].shape)
-    print("Occupancy:", sample["target_occupancy"].shape)
+    print("Occupancy:", sample["target_surface"].shape)
     print(
         "Positive ratio:",
-        sample["target_occupancy"].mean().item(),
+        sample["target_surface"].mean().item(),
     )
