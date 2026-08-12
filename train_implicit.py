@@ -10,11 +10,12 @@ import trimesh
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from configs.run_config import get_run_dir, get_run_name
-from configs.ablations import ABLATIONS, ABLATION_DESCRIPTIONS
+from configs.ablation_decoders import DECODER_ABLATIONS, ABLATION_DESCRIPTIONS
 from models.implicit_network import ImplicitDecoderBasic, MultiModalFeatureEncoder
-from models.dinocomplete import DinoCompleteBaselineEncoder
+from models.dinocomplete import DinoCompleteBaselineEncoder, DinoInspiredDecoder
+from models.test_models import GeometryOnlyEncoder
 from utils.evaluation import evaluate_test_set
-from utils.implicit_dataset import ScanNetppImplicitDataset
+from utils.implicit_dataset2 import ScanNetppImplicitDataset
 from utils.training import train_model
 
 RUN_NAME = get_run_name()
@@ -33,22 +34,22 @@ if __name__ == "__main__":
     # ==========================================================
     
     # TODO: Select the ARCHITECTURE
-    ARCHITECTURE = "dinocomplete"
-    #ARCHITECTURE = "ours"
+    #ARCHITECTURE = "dinocomplete"
+    ARCHITECTURE = "ours"
 
     # TODO: Select the ABLATION CONFIGURATION   
-    ABLATION = "baseline"
+    #ABLATION = "baseline"
     #ABLATION = "hidden384"
-    #ABLATION = "hidden384_fourier"
+    ABLATION = "hidden384_fourier"
     #ABLATION = "hidden384_fourier_residual"
 
     if ARCHITECTURE == "ours":
-        if ABLATION not in ABLATIONS:
+        if ABLATION not in DECODER_ABLATIONS:
             raise ValueError(
                 f"Unknown ablation '{ABLATION}'. "
-                f"Available: {list(ABLATIONS.keys())}"
+                f"Available: {list(DECODER_ABLATIONS.keys())}"
             )
-        ablation_config = ABLATIONS[ABLATION]
+        ablation_config = DECODER_ABLATIONS[ABLATION]
 
     else:
         ablation_config = None
@@ -57,8 +58,9 @@ if __name__ == "__main__":
 
     DATA_DIR = "data/pairs_scannet/train/*.pt"
 
-    LR = 1e-3
+    LR = 1e-4
     WD = 1e-4
+    #WD = 0.0
 
     RUN_NAME = "scannet_train"
 
@@ -108,9 +110,36 @@ if __name__ == "__main__":
         generator=torch.Generator().manual_seed(42)
     )
 
-    train_dataset = ScanNetppImplicitDataset(train_files)
-    val_dataset = ScanNetppImplicitDataset(val_files)
-    test_dataset = ScanNetppImplicitDataset(test_files)
+    train_dataset = ScanNetppImplicitDataset(
+        train_files,
+        num_input_pts=2048,
+        num_queries=8192,
+    )
+
+    print("\nChecking training samples...")
+
+    for i in range(5):
+        sample = train_dataset[i]
+
+        targets = sample["target_surface"]
+
+        print(
+            f"Sample {i}: "
+            f"queries={sample['query_coords'].shape[0]} "
+            f"positive_ratio={targets.float().mean().item():.4f}"
+        )
+
+    val_dataset = ScanNetppImplicitDataset(
+        val_files,
+        num_input_pts=2048,
+        num_queries=8192,
+    )
+
+    test_dataset = ScanNetppImplicitDataset(
+        test_files,
+        num_input_pts=2048,
+        num_queries=8192,
+    )
 
     print(
         f"📊 Train: {len(train_dataset)} | "
@@ -118,9 +147,29 @@ if __name__ == "__main__":
         f"Test: {len(test_dataset)}"
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
+    BATCH_SIZE = 16
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+    )
 
     sample_data = torch.load(data_files[0], map_location="cpu", weights_only=False)
     detected_dim = sample_data['partial_feats'].shape[-1]
@@ -136,28 +185,38 @@ if __name__ == "__main__":
 
     # Encoder selection based on the architecture
     if ARCHITECTURE == "ours":
-        encoder = MultiModalFeatureEncoder(
+        """encoder = MultiModalFeatureEncoder(
             input_feat_dim=INPUT_DIM,
             latent_dim=512,
-        ).to(device)
+        ).to(device)"""
+        encoder = DinoCompleteBaselineEncoder().to(device)
 
     elif ARCHITECTURE == "dinocomplete":
         encoder = DinoCompleteBaselineEncoder().to(device)
+        """encoder = MultiModalFeatureEncoder(
+            input_feat_dim=1408,
+            latent_dim=512,
+        ).to(device)"""
 
     if ARCHITECTURE == "ours":
 
-        decoder = ImplicitDecoderBasic(
+        """decoder = ImplicitDecoderBasic(
             latent_dim=1024,
             **ablation_config,
-        ).to(device)
-
-    elif ARCHITECTURE == "dinocomplete":
-
+        ).to(device)"""
         decoder = ImplicitDecoderBasic(
             latent_dim=1024,
             hidden_dim=256,
-            use_fourier=False,
+            use_fourier=True,
             use_residual=False,
+        ).to(device)
+
+
+    elif ARCHITECTURE == "dinocomplete":
+        decoder = DinoInspiredDecoder(
+            latent_dim=1024,
+            coord_dim=128,
+            hidden_dim=512,
         ).to(device)
 
     # Calculate total number of parameters in the model
@@ -169,11 +228,11 @@ if __name__ == "__main__":
 
     print(f"Total parameters: {num_params:,}")
 
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adam(
         list(encoder.parameters()) +
         list(decoder.parameters()),
         lr=LR,
-        weight_decay=WD,
+        weight_decay=WD
     )
     criterion = nn.BCEWithLogitsLoss()
 
@@ -255,7 +314,7 @@ if __name__ == "__main__":
     os.makedirs(f"{RUN_DIR}/snapshots", exist_ok=True)
     os.makedirs(f"{RUN_DIR}/checkpoints", exist_ok=True)
 
-    epochs = 150
+    epochs = 100
     
     # ==========================================
     # MODEL SUMMARY
@@ -299,7 +358,7 @@ if __name__ == "__main__":
             f.write("Context: Shared Transformer\n")
             f.write("Pooling: Attention\n")
 
-        f.write(f"Batch size: 32\n")
+        f.write(f"Batch size: {BATCH_SIZE}\n")
         f.write(f"Epochs: {epochs}\n")
         f.write(f"Optimizer: AdamW\n")
         f.write(f"Learning rate: {LR}\n")
@@ -307,6 +366,16 @@ if __name__ == "__main__":
         f.write(f"Parameters: {num_params:,}\n")
 
     first_batch = next(iter(train_loader))
+
+    print("\nFirst training batch:")
+    print("partial_pts:", first_batch["partial_pts"].shape)
+    print("partial_feats:", first_batch["partial_feats"].shape)
+    print("query_coords:", first_batch["query_coords"].shape)
+    print("target_surface:", first_batch["target_surface"].shape)
+    print(
+        "positive ratio:",
+        first_batch["target_surface"].float().mean().item()
+    )
 
     print(first_batch['partial_feats'].shape)
 

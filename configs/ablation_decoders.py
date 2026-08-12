@@ -1,8 +1,8 @@
 # ============================================================
-# ABLATION CONFIGURATIONS
+# ABLATION DECODER CONFIGURATIONS
 # ============================================================
 
-ABLATIONS = {
+DECODER_ABLATIONS = {
     # Experiment 1: Original baseline
     "baseline": {
         "hidden_dim": 256,
@@ -35,7 +35,7 @@ ABLATIONS = {
     },
 }
 
-ABLATION_DESCRIPTIONS = {
+DECODER_ABLATION_DESCRIPTIONS = {
 
     "baseline":
         "Baseline implicit decoder",

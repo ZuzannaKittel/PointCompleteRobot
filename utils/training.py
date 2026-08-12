@@ -11,9 +11,9 @@ from models.dinocomplete import DinoCompleteBaselineEncoder
 from configs.run_config import RUN_DIR, get_run_decoder, get_run_model, get_run_name, get_run_dir
 from utils.evaluation import extract_implicit_shape
 
-THRESHOLD = 0.6
+from utils.evaluation import THRESHOLD
 
-def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs, start_epoch=0, RUN_NAME=None, RUN_DIR=None, resume_training=False):
+def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimizer, criterion, device, epochs, start_epoch=0, RUN_NAME=None, RUN_DIR=None, resume_training=False, config=None):
     if RUN_NAME is None:
         RUN_NAME = get_run_name()
     if RUN_DIR is None:
@@ -60,19 +60,53 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
     epochs_without_improvement = 0
     best_val_loss = float("inf")
 
+    # Create the LR scheduler 
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=5,
+        threshold=1e-4,
+        min_lr=1e-6,
+    )
+
     if resume_training:
         best_ckpt_path = f"{RUN_DIR}/checkpoints/best_model.pth"
         latest_ckpt_path = f"{RUN_DIR}/checkpoints/latest_model.pth"
 
+        if os.path.exists(latest_ckpt_path):
+            checkpoint = torch.load(
+                latest_ckpt_path,
+                map_location=device,
+            )
+
+            if "scheduler_state_dict" in checkpoint:
+                scheduler.load_state_dict(
+                    checkpoint["scheduler_state_dict"]
+                )
+
         if os.path.exists(best_ckpt_path):
-            checkpoint = torch.load(best_ckpt_path, map_location=device)
+            checkpoint = torch.load(
+                best_ckpt_path,
+                map_location=device,
+            )
+
             best_val_loss = checkpoint["val_loss"]
 
             if os.path.exists(latest_ckpt_path):
-                checkpoint_latest = torch.load(latest_ckpt_path, map_location=device)
-                epochs_without_improvement = checkpoint_latest.get("epochs_without_improvement", 0)
+                checkpoint_latest = torch.load(
+                    latest_ckpt_path,
+                    map_location=device,
+                )
+                epochs_without_improvement = checkpoint_latest.get(
+                    "epochs_without_improvement",
+                    0,
+                )
             else:
-                epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
+                epochs_without_improvement = checkpoint.get(
+                    "epochs_without_improvement",
+                    0,
+                )
 
             print(
                 f"📂 Found previous best model "
@@ -89,32 +123,12 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
             )
             history = history[history["epoch"] <= start_epoch].reset_index(drop=True)
 
-    # Create the LR scheduler ONCE
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=6,
-    )
-
-    config = {
-            "input_features": get_run_model(),
-            "encoder_latent_dim": 512,
-            "global_latent_dim": 1024,
-            "decoder": get_run_decoder(),
-            "epochs": epochs,
-            "batch_size": 32,
-            "learning_rate": optimizer.param_groups[0]["lr"],
-            "hidden_dim": 256,
-            "threshold": THRESHOLD,
-            "resolution_eval": 128,
-            "weight_decay": optimizer.param_groups[0]["weight_decay"]
-        }
-
-    pd.DataFrame([config]).to_csv(
-        f"{RUN_DIR}/config.csv",
-        index=False
-    )
+    # Save experiment config to CSV for reproducibility
+    if config is not None:
+        pd.DataFrame([config]).to_csv(
+            f"{RUN_DIR}/config.csv",
+            index=False
+        )
 
     for epoch in range(start_epoch, epochs):
 
@@ -131,20 +145,17 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
             p_feats = batch['partial_feats'].to(device) # Multi-modal features (e.g., fused Utonia + DINOv2) for each point 
             p_pts = batch["partial_pts"].to(device) # Geometric points
             q_coords = batch['query_coords'].to(device) # Continuous query coordinates for occupancy evaluation 
-            targets = batch['target_occupancy'].to(device) # Binary occupancy labels for each query coordinate
+            targets = batch['target_surface'].to(device) # Binary surface occupancylabels for each query coordinate
 
             # Print the positive occupancy ratio for the first batch of the first epoch to monitor class imbalance
             if epoch == 0 and running_loss == 0:
                 print(
-                    f"Positive occupancy ratio: "
+                    f"Positive surface occupancy ratio: "
                     f"{targets.float().mean().item():.4f}"
                 )
             
-            # Depends on the architecture
-            if isinstance(encoder, DinoCompleteBaselineEncoder):
-                latents = encoder(p_pts, p_feats)
-            else:
-                latents = encoder(p_feats)
+            # Universal architecture
+            latents = encoder(p_pts, p_feats)
 
             pred_logits = decoder(q_coords, latents)
             
@@ -177,14 +188,10 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
                 p_pts = batch["partial_pts"].to(device)
                 p_feats = batch['partial_feats'].to(device)
                 q_coords = batch['query_coords'].to(device)
-                targets = batch['target_occupancy'].to(device)
+                targets = batch['target_surface'].to(device)
 
-                # Depends on the architecture
-                if isinstance(encoder, DinoCompleteBaselineEncoder):
-                    latents = encoder(p_pts, p_feats)
-                else:
-                    latents = encoder(p_feats)
-
+                # Universal architecture
+                latents = encoder(p_pts, p_feats)
                 pred_logits = decoder(q_coords, latents)
 
                 loss = criterion(pred_logits, targets)
@@ -229,6 +236,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
                 "encoder_state_dict": encoder.state_dict(),
                 "decoder_state_dict": decoder.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "val_loss": val_loss,
                 "epochs_without_improvement": epochs_without_improvement,
             },
@@ -250,6 +258,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
                 "encoder_state_dict": encoder.state_dict(),
                 "decoder_state_dict": decoder.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "loss": epoch_loss,
                 "val_loss": val_loss,
                 "epochs_without_improvement": epochs_without_improvement,
@@ -264,7 +273,7 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
                 v_feats = val_sample['partial_feats'].to(device)
 
                 # Extract implicit shape from the model
-                recon_pts, inference_time = extract_implicit_shape(encoder, decoder, v_pts, v_feats, device, resolution=128, threshold=THRESHOLD)
+                recon_pts, inference_time = extract_implicit_shape(encoder, decoder, v_pts, v_feats, device, resolution=64, threshold=THRESHOLD, RUN_DIR=RUN_DIR)
 
                 base_snap_path = (f"{RUN_DIR}/snapshots/"f"epoch_{epoch+1:02d}_obj{sample_idx}")
                 

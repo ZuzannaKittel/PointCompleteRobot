@@ -1,16 +1,16 @@
 import os
 import numpy as np
 import torch
+import sys
 from scipy.spatial import cKDTree
+
 from configs.run_config import get_run_dir
 import trimesh
 import matplotlib.pyplot as plt
 import pandas as pd
 import time
 
-from models.dinocomplete import DinoCompleteBaselineEncoder
-
-THRESHOLD = 0.6
+THRESHOLD = 0.5  # Default threshold for occupancy probability
 
 # ==========================================
 # Chamfer Distance Evaluation Metric
@@ -50,9 +50,16 @@ def fscore(pred_pts,
     )
 
 # ==========================================
-# INFERENCE GRID SAMPLER (Utonia+DINOv2-Feature-Driven)
+# IMPLICIT SHAPE EXTRACTION
 # ==========================================
 def extract_implicit_shape(encoder, decoder, partial_pts, partial_feats, device, resolution=64, threshold=0.5, RUN_DIR=None):
+    # 1. Fallback to default run dir if None
+    if RUN_DIR is None:
+        RUN_DIR = get_run_dir()
+
+    # 2. Ensure the target directory actually exists
+    os.makedirs(RUN_DIR, exist_ok=True)
+
     encoder.eval()
     decoder.eval()
     with torch.no_grad():
@@ -60,15 +67,33 @@ def extract_implicit_shape(encoder, decoder, partial_pts, partial_feats, device,
         start = time.time()
 
         # Build multi-modal structural latent vector
-        if isinstance(encoder, DinoCompleteBaselineEncoder):
-            final_latent = encoder(partial_pts.unsqueeze(0), partial_feats.unsqueeze(0))
-        else:
-            final_latent = encoder(partial_feats.unsqueeze(0))
+        final_latent = encoder(partial_pts.unsqueeze(0), partial_feats.unsqueeze(0))
         
-        # Query discrete locations across the scalar matrix field
-        linear_spaces = torch.linspace(-0.5, 0.5, resolution, device=device)
-        grid_x, grid_y, grid_z = torch.meshgrid(linear_spaces, linear_spaces, linear_spaces, indexing='ij')
-        eval_coords = torch.stack([grid_x, grid_y, grid_z], dim=-1).view(1, -1, 3)
+        # Query discrete locations across the canonical object volume.
+        linear_spaces = torch.linspace(
+            -0.5,
+            0.5,
+            resolution,
+            device=device,
+        )
+
+        grid_x, grid_y, grid_z = torch.meshgrid(
+            linear_spaces,
+            linear_spaces,
+            linear_spaces,
+            indexing="ij",
+        )
+
+        eval_coords = torch.stack(
+            [grid_x, grid_y, grid_z],
+            dim=-1,
+        ).view(1, -1, 3)
+
+        print(
+            "Inference grid:",
+            eval_coords.min().item(),
+            eval_coords.max().item(),
+        )
         
         chunk_size = 50000
         pred_slices = []
@@ -131,7 +156,7 @@ def save_test_sample(sample_idx, prefix,
     sample = test_dataset[sample_idx]
     pts = sample["partial_pts"].to(device)
     feats = sample['partial_feats'].to(device)
-    recon_pts, inference_time = extract_implicit_shape(encoder, decoder, pts, feats, device, resolution=128, threshold=THRESHOLD)
+    recon_pts, inference_time = extract_implicit_shape(encoder, decoder, pts, feats, device, resolution=64, threshold=THRESHOLD, RUN_DIR=RUN_DIR)
     if len(recon_pts) == 0:
         print(f"Skipping {prefix}: empty reconstruction")
         return
@@ -169,7 +194,7 @@ def evaluate_test_set(encoder, decoder, test_dataset, device, RUN_DIR=None):
             sample = test_dataset[idx]
             pts = sample["partial_pts"].to(device)
             feats = sample['partial_feats'].to(device)
-            recon_pts, inference_time = extract_implicit_shape(encoder, decoder, pts, feats, device, resolution=128, threshold=THRESHOLD, RUN_DIR=RUN_DIR)
+            recon_pts, inference_time = extract_implicit_shape(encoder, decoder, pts, feats, device, resolution=64, threshold=THRESHOLD, RUN_DIR=RUN_DIR)
 
             all_runtime.append(inference_time)
 
