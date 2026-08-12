@@ -3,24 +3,75 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
+def print_geometry(name, pts):
+    pts = np.asarray(pts)
+
+    mins = pts.min(axis=0)
+    maxs = pts.max(axis=0)
+
+    extents = maxs - mins
+    center = (mins + maxs) / 2
+
+    print(f"\n{name}")
+    print(f"  center  : {center}")
+    print(f"  extents : {extents}")
+    print(f"  max dim : {extents.max():.4f}")
+    print(f"  min dim : {extents.min():.4f}")
+    print(f"  ratio   : {extents / extents.max()}")
+
+def print_pca(name, pts):
+    pca = PCA(n_components=3)
+    pca.fit(pts)
+
+    print(f"\n{name} PCA")
+    print("explained variance:", pca.explained_variance_ratio_)
+    print("axes:")
+    print(np.round(pca.components_, 3))
+
 def visualize_saved_pair_truthful(pt_file_path):
     print(f"\n🔍 Verifying alignment for: {pt_file_path}")
     data = torch.load(pt_file_path, map_location='cpu')
 
+    print("\nMetadata")
+    dataset = data.get("dataset", "Unknown")
+
+    print(f"\nDataset: {dataset}")
+
+    if dataset == "ScanNet++":
+        print("scene   :", data["scene_id"])
+
+    print("object  :", data["object_id"])
+    print("category:", data["category"])
+
     # Extract
     partial_pts = data["partial_pts"].numpy()
     gt_pts = data["gt_pts"].numpy()
-    # The anchor_world is the object's translation vector used during generation
-    # We use this to ensure we aren't "re-centering" incorrectly
-    anchor = data["anchor_world"].numpy() 
+
+    print_geometry("Partial", partial_pts)
+    print_geometry("GT", gt_pts)
+
+    print_pca("Partial", partial_pts)
+    print_pca("GT", gt_pts)
 
     # Clean
     partial_pts = partial_pts[np.any(partial_pts != 0, axis=1)]
 
-    # We do NOT center independently anymore.
-    # We treat both as being in a local canonical space, but we keep 
-    # their relative orientation intact.
-    
+    print("\nPartial mean:")
+    print(partial_pts.mean(axis=0))
+
+    print("\nGT mean:")
+    print(gt_pts.mean(axis=0))
+
+    print("\nPartial covariance:")
+    print(np.round(np.cov(partial_pts.T), 3))
+
+    print("\nGT covariance:")
+    print(np.round(np.cov(gt_pts.T), 3))
+
+    print("\nFeature shapes:")
+    print(f"  Partial: {partial_pts.shape[0]} points")
+    print(f"  GT: {gt_pts.shape[0]} points")
+
     # PCA Coloring for the scan
     try:
         pca = PCA(n_components=3)
@@ -57,4 +108,4 @@ def visualize_saved_pair_truthful(pt_file_path):
     plt.show()
 
 # Usage
-visualize_saved_pair_truthful("./data/geometric_pairs_dataset2/train/pair_00049_355e5e32db_sofa_28.pt")
+visualize_saved_pair_truthful("./data/pairs_scannet/train/pair_01815_acd95847c5_display_75.pt")

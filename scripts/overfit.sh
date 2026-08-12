@@ -24,7 +24,7 @@ echo "================================="
 
 cd /mnt/aiongpfs/users/zkittel/PointCompleteRobot/
 
-python train_implicit2.py
+python utils/overfit_one_sample.py
 
 echo "================================="
 echo "Finished: $(date)"

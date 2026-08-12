@@ -24,7 +24,7 @@ echo "================================="
 
 cd /mnt/aiongpfs/users/zkittel/PointCompleteRobot/data_processing 
 
-python data_factory_shapenet.py
+python data_factory_scannet.py
 
 echo "================================="
 echo "Finished: $(date)"
