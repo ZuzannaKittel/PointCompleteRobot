@@ -18,7 +18,7 @@ from models.decoders import ImplicitDecoderBasic
 
 from models.dinocomplete import (
     DinoCompleteBaselineEncoder,
-    DinoInspiredDecoder,
+    DinoCompleteProxyDecoder,
 )
 
 from models.encoders import AblationEncoder
@@ -45,19 +45,18 @@ if __name__ == "__main__":
     # ARCHITECTURE = "dinocomplete"
 
     # ENCODER_ABLATION = "coord_dino"
-    ENCODER_ABLATION = "utonia_dino"
-    # ENCODER_ABLATION = "utonia"
+    # ENCODER_ABLATION = "utonia_dino"
+    ENCODER_ABLATION = "utonia"
 
-    # DECODER_ABLATION = "hidden384_fourier"
-    # DECODER_ABLATION = "baseline"
-    # DECODER_ABLATION = "hidden384"
-    DECODER_ABLATION = "hidden384_fourier_residual"
+    DECODER_ABLATION = "baseline"
+    # DECODER_ABLATION = "fourier"
+    # DECODER_ABLATION = "fourier_residual"
 
     MODE = "scannet_train"
     DATA_DIR = "data/pairs_scannet/train/*.pt"
 
     LR = 1e-4
-    WD = 5e-4
+    WD = 1e-4
     BATCH_SIZE = 32
     EPOCHS = 100
 
@@ -299,11 +298,7 @@ if __name__ == "__main__":
         ).to(device)
 
     elif ARCHITECTURE == "dinocomplete":
-        decoder = DinoInspiredDecoder(
-            latent_dim=1024,
-            coord_dim=128,
-            hidden_dim=512,
-        ).to(device)
+        decoder = DinoCompleteProxyDecoder().to(device)
 
     # ============================================================
     # MODEL INFORMATION
