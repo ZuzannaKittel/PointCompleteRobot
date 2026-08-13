@@ -250,7 +250,9 @@ def train_model(encoder, decoder, train_loader, val_loader, val_dataset, optimiz
         # --------------------------------------------------
         # CHECKPOINT + VISUALIZATION
         # --------------------------------------------------
-        if (epoch + 1) % 3 == 0 or epoch == epochs - 1:
+        # Save the latest checkpoint every epoch so the most recent
+        # model state is always available for resuming or inspection.
+        if True:
             # Save checkpoint
             ckpt_path = (f"{RUN_DIR}/checkpoints/latest_model.pth")
             torch.save({
