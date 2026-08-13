@@ -44,20 +44,20 @@ if __name__ == "__main__":
     ARCHITECTURE = "ours"
     # ARCHITECTURE = "dinocomplete"
 
-    ENCODER_ABLATION = "coord_dino"
-    # ENCODER_ABLATION = "utonia_dino"
+    # ENCODER_ABLATION = "coord_dino"
+    ENCODER_ABLATION = "utonia_dino"
     # ENCODER_ABLATION = "utonia"
 
-    DECODER_ABLATION = "hidden384_fourier"
+    # DECODER_ABLATION = "hidden384_fourier"
     # DECODER_ABLATION = "baseline"
     # DECODER_ABLATION = "hidden384"
-    # DECODER_ABLATION = "hidden384_fourier_residual"
+    DECODER_ABLATION = "hidden384_fourier_residual"
 
     MODE = "scannet_train"
     DATA_DIR = "data/pairs_scannet/train/*.pt"
 
     LR = 1e-4
-    WD = 1e-4
+    WD = 5e-4
     BATCH_SIZE = 32
     EPOCHS = 100
 
@@ -180,18 +180,30 @@ if __name__ == "__main__":
         train_files,
         num_input_pts=2048,
         num_queries=8192,
+        occupancy_threshold=0.01,
+        boundary_sigma=0.005,
+        #boundary_fraction=0.3,
+        deterministic=False,
     )
 
     val_dataset = ScanNetppImplicitDataset(
         val_files,
         num_input_pts=2048,
         num_queries=8192,
+        occupancy_threshold=0.01,
+        boundary_sigma=0.005,
+        #boundary_fraction=0.3,
+        deterministic=True,
     )
 
     test_dataset = ScanNetppImplicitDataset(
         test_files,
         num_input_pts=2048,
         num_queries=8192,
+        occupancy_threshold=0.01,
+        boundary_sigma=0.005,
+        #boundary_fraction=0.3,
+        deterministic=True,
     )
 
     print("\nChecking training samples...")
@@ -416,13 +428,13 @@ if __name__ == "__main__":
             if decoder_config.get("use_fourier", False):
                 f.write(
                     "Fourier bands: "
-                    f"{decoder_config.get('num_fourier_bands', 10)}\n"
+                    f"{decoder_config.get('num_fourier_bands', 6)}\n"
                 )
 
             if decoder_config.get("use_residual", False):
                 f.write(
                     "Residual blocks: "
-                    f"{decoder_config.get('num_residual_blocks', 4)}\n"
+                    f"{decoder_config.get('num_residual_blocks', 2)}\n"
                 )
 
         else:
@@ -493,17 +505,44 @@ if __name__ == "__main__":
     # Build config dictionary for logging and reproducibility
     experiment_config = {
         "architecture": ARCHITECTURE,
-        "encoder_ablation": ENCODER_ABLATION if ARCHITECTURE == "ours" else "dinocomplete",
-        "decoder_ablation": DECODER_ABLATION if ARCHITECTURE == "ours" else "dinocomplete",
-        "encoder_description": ENCODER_ABLATION_DESCRIPTIONS[ENCODER_ABLATION]
-            if ARCHITECTURE == "ours" else "Original DINOComplete encoder",
-        "decoder_description": DECODER_ABLATION_DESCRIPTIONS[DECODER_ABLATION]
-            if ARCHITECTURE == "ours" else "Original DINOComplete decoder",
+        "encoder_ablation": (
+            ENCODER_ABLATION
+            if ARCHITECTURE == "ours"
+            else "dinocomplete"
+        ),
+        "decoder_ablation": (
+            DECODER_ABLATION
+            if ARCHITECTURE == "ours"
+            else "dinocomplete"
+        ),
+        "encoder_description": (
+            ENCODER_ABLATION_DESCRIPTIONS[ENCODER_ABLATION]
+            if ARCHITECTURE == "ours"
+            else "Original DINOComplete encoder"
+        ),
+        "decoder_description": (
+            DECODER_ABLATION_DESCRIPTIONS[DECODER_ABLATION]
+            if ARCHITECTURE == "ours"
+            else "Original DINOComplete decoder"
+        ),
+
+        # Dataset
+        "num_input_points": 2048,
+        "num_queries": 8192,
+        "occupancy_distance_threshold": 0.01,
+        "boundary_sigma": 0.005,
+        "boundary_fraction": 0.3,
+
+        # Training
         "batch_size": BATCH_SIZE,
         "epochs": EPOCHS,
         "learning_rate": LR,
         "weight_decay": WD,
+
+        # Inference
         "reconstruction_probability_threshold": THRESHOLD,
+
+        # Optimization
         "scheduler": "ReduceLROnPlateau",
         "scheduler_factor": 0.5,
         "scheduler_patience": 5,
