@@ -99,8 +99,8 @@ class MultiModalFeatureEncoder(nn.Module):
 
         self.output_dim = latent_dim * 2
 
-    def forward(self, partial_feats):
-        # [B, N, input_dim]
+    def forward(self, partial_pts, partial_feats):
+
         if self.input_feat_dim == 1024:
             x = self.utonia_projection(partial_feats)
         else:
