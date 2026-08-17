@@ -17,7 +17,9 @@ from configs.ablation_encoders import (
 from models.decoders import ImplicitDecoderBasic
 from models.encoders import AblationEncoder
 
-from models.implicit_network import MultiModalFeatureEncoder
+from models.shapenet_pretrain import (
+    ShapeNetBranchPretrainEncoder,
+)
 
 from models.dinocomplete import (
     DinoCompleteBaselineEncoder,
@@ -207,6 +209,79 @@ def transfer_compatible_weights(
 
     return len(compatible), len(skipped)
 
+def transfer_shapenet_encoder(
+    shapenet_encoder,
+    scannet_encoder,
+    encoder_type,
+):
+    print("\nShapeNet → ScanNet encoder transfer:")
+
+    if encoder_type == "utonia_dino":
+        scannet_encoder.utonia_input_norm.load_state_dict(
+            shapenet_encoder.utonia_input_norm.state_dict()
+        )
+        scannet_encoder.utonia_encoder.load_state_dict(
+            shapenet_encoder.utonia_encoder.state_dict()
+        )
+        scannet_encoder.utonia_context.load_state_dict(
+            shapenet_encoder.utonia_context.state_dict()
+        )
+
+        print("  Utonia input norm      : transferred")
+        print("  Utonia encoder         : transferred")
+        print("  Utonia context         : transferred")
+        print("  DINO branch            : random initialization")
+        print("  Multimodal fusion      : random initialization")
+        print("  Global projection      : random initialization")
+
+    elif encoder_type == "coord_dino":
+        scannet_encoder.geometry_encoder.load_state_dict(
+            shapenet_encoder.geometry_encoder.state_dict()
+        )
+        scannet_encoder.geo_context.load_state_dict(
+            shapenet_encoder.geo_context.state_dict()
+        )
+
+        print("  Geometry encoder       : transferred")
+        print("  Geometry context       : transferred")
+        print("  DINO branch            : random initialization")
+        print("  Multimodal fusion      : random initialization")
+        print("  Global projection      : random initialization")
+
+    elif encoder_type == "utonia":
+        scannet_encoder.utonia_input_norm.load_state_dict(
+            shapenet_encoder.utonia_input_norm.state_dict()
+        )
+
+        scannet_encoder.utonia_encoder.load_state_dict(
+            shapenet_encoder.utonia_encoder.state_dict()
+        )
+
+        scannet_encoder.context.load_state_dict(
+            shapenet_encoder.utonia_context.state_dict()
+        )
+
+        # For the Utonia-only model, the post-branch fusion is also
+        # dimensionally identical to the ShapeNet branch projection.
+        scannet_encoder.fusion.load_state_dict(
+            shapenet_encoder.branch_projection.state_dict()
+        )
+
+        scannet_encoder.global_projection.load_state_dict(
+            shapenet_encoder.global_projection.state_dict()
+        )
+
+        print("  Utonia input norm      : transferred")
+        print("  Utonia encoder         : transferred")
+        print("  Utonia context         : transferred")
+        print("  Fusion                 : transferred")
+        print("  Global projection      : transferred")
+
+    else:
+        raise ValueError(
+            f"Unknown encoder type: {encoder_type}"
+        )
+
 
 def build_scanet_model(
     architecture,
@@ -242,30 +317,12 @@ def build_scanet_model(
 
 
 def build_shapenet_model(
-    architecture,
+    pretrain_mode,
     decoder_config,
     device,
 ):
-    """
-    ShapeNet pretraining model.
-
-    ShapeNet uses 1024-D features, so the encoder is the
-    original MultiModalFeatureEncoder.
-
-    The decoder is kept identical to the decoder used by
-    the ScanNet 'ours' model so that its weights can be
-    transferred directly.
-    """
-
-    if architecture != "ours":
-        raise ValueError(
-            "ShapeNet pretraining is currently "
-            "implemented for ARCHITECTURE='ours'."
-        )
-
-    encoder = MultiModalFeatureEncoder(
-        input_feat_dim=1024,
-        latent_dim=512,
+    encoder = ShapeNetBranchPretrainEncoder(
+        mode=pretrain_mode,
     ).to(device)
 
     decoder = ImplicitDecoderBasic(
@@ -278,6 +335,7 @@ def build_shapenet_model(
 
 def train_shapenet_stage(
     device,
+    pretrain_mode,
     decoder_config,
     run_name,
     run_dir,
@@ -311,11 +369,11 @@ def train_shapenet_stage(
     if detected_dim != 1024:
         raise ValueError(
             "ShapeNet pretraining expects 1024-D "
-            f"features, got {detected_dim}."
+            f"Utonia features, got {detected_dim}."
         )
 
     encoder, decoder = build_shapenet_model(
-        architecture="ours",
+        pretrain_mode=pretrain_mode,
         decoder_config=decoder_config,
         device=device,
     )
@@ -421,62 +479,48 @@ def train_shapenet_stage(
         "w",
     ) as f:
 
+        f.write("Dataset: ShapeNet\n")
+        f.write("Training stage: ShapeNet branch pretraining\n")
         f.write(
-            "Dataset: ShapeNet\n"
+            f"Pretraining mode: {pretrain_mode}\n"
         )
-
-        f.write(
-            "Training stage: ShapeNet pretraining\n"
-        )
-
-        f.write(
-            "Encoder: MultiModalFeatureEncoder\n"
-        )
-
         f.write(
             "Input feature dimension: 1024\n"
         )
 
-        f.write(
-            "Encoder latent: 512\n"
-        )
+        if pretrain_mode == "utonia":
+            f.write(
+                "Pretrained branch: Utonia\n"
+            )
+        elif pretrain_mode == "coords":
+            f.write(
+                "Pretrained branch: Coordinates\n"
+            )
 
         f.write(
-            "Global latent: 1024 (mean + max)\n"
+            "Encoder output: 1024-D\n"
         )
-
         f.write(
-            "Decoder latent: 1024\n"
+            "Decoder: ImplicitDecoderBasic\n"
         )
-
         f.write(
             f"Decoder hidden dimension: "
             f"{decoder_config['hidden_dim']}\n"
         )
-
         f.write(
-            f"Batch size: 32\n"
+            f"Fourier encoding: "
+            f"{decoder_config.get('use_fourier', False)}\n"
         )
-
         f.write(
-            f"Epochs: {epochs}\n"
+            f"Residual decoder: "
+            f"{decoder_config.get('use_residual', False)}\n"
         )
-
-        f.write(
-            "Optimizer: AdamW\n"
-        )
-
-        f.write(
-            "Learning rate: 5e-4\n"
-        )
-
-        f.write(
-            "Weight decay: 1e-4\n"
-        )
-
-        f.write(
-            f"Parameters: {num_params:,}\n"
-        )
+        f.write(f"Batch size: {BATCH_SIZE}\n")
+        f.write(f"Epochs: {epochs}\n")
+        f.write("Optimizer: AdamW\n")
+        f.write("Learning rate: 5e-4\n")
+        f.write("Weight decay: 1e-4\n")
+        f.write(f"Parameters: {num_params:,}\n")
 
     first_batch = next(
         iter(train_loader)
@@ -509,7 +553,7 @@ def train_shapenet_stage(
     experiment_config = {
         "dataset": "shapenet",
         "training_stage": "pretraining",
-        "input_feature_dim": 1024,
+        "input_feature_dim": detected_dim,
         "num_input_points": 2048,
         "num_queries": 8192,
         "occupancy_distance_threshold": 0.01,
@@ -585,6 +629,50 @@ def train_shapenet_stage(
         best_path,
     )
 
+def load_shapenet_best_model(
+    pretrain_mode,
+    decoder_config,
+    device,
+    run_dir,
+):
+    print("\n============================================================")
+    print("LOADING BEST SHAPENET PRETRAINED MODEL")
+    print("============================================================")
+
+    encoder, decoder = build_shapenet_model(
+        pretrain_mode=pretrain_mode,
+        decoder_config=decoder_config,
+        device=device,
+    )
+
+    best_path = os.path.join(
+        run_dir,
+        "checkpoints",
+        "best_model.pth",
+    )
+
+    if not os.path.exists(best_path):
+        raise FileNotFoundError(
+            f"ShapeNet best checkpoint not found:\n{best_path}"
+        )
+
+    checkpoint = torch.load(
+        best_path,
+        map_location=device,
+        weights_only=False,
+    )
+
+    encoder.load_state_dict(
+        checkpoint["encoder_state_dict"]
+    )
+
+    decoder.load_state_dict(
+        checkpoint["decoder_state_dict"]
+    )
+
+    print(f"✅ Loaded ShapeNet best model:\n{best_path}")
+
+    return encoder, decoder, best_path
 
 if __name__ == "__main__":
 
@@ -618,14 +706,13 @@ if __name__ == "__main__":
     ARCHITECTURE = "ours"
     # ARCHITECTURE = "dinocomplete"
 
-    ENCODER_ABLATION = "utonia_dino"
     # ENCODER_ABLATION = "coord_dino"
+    ENCODER_ABLATION = "utonia_dino"
     # ENCODER_ABLATION = "utonia"
 
-    # DECODER_ABLATION = "hidden384_fourier_residual"
     # DECODER_ABLATION = "baseline"
-    # DECODER_ABLATION = "hidden384"
-    DECODER_ABLATION = "hidden384_fourier"
+    # DECODER_ABLATION = "fourier"
+    DECODER_ABLATION = "fourier_residual"
 
     # ============================================================
     # TRAINING
@@ -641,6 +728,18 @@ if __name__ == "__main__":
 
     SCANNET_LR = 1e-4
     SCANNET_WD = 1e-4
+
+    if ENCODER_ABLATION == "utonia_dino":
+        SHAPENET_PRETRAIN_MODE = "utonia"
+    elif ENCODER_ABLATION == "coord_dino":
+        SHAPENET_PRETRAIN_MODE = "coords"
+    elif ENCODER_ABLATION == "utonia":
+        SHAPENET_PRETRAIN_MODE = "utonia"
+    else:
+        raise ValueError(
+            f"No ShapeNet pretraining mode defined for "
+            f"{ENCODER_ABLATION}"
+        )
 
     # ============================================================
     # VALIDATE CONFIG
@@ -780,24 +879,16 @@ if __name__ == "__main__":
             shapenet_best_path,
         ) = train_shapenet_stage(
             device=device,
+            pretrain_mode=SHAPENET_PRETRAIN_MODE,
             decoder_config=decoder_config,
             run_name=shapenet_run_name,
             run_dir=shapenet_run_dir,
             epochs=SHAPENET_EPOCHS,
         )
 
-        print(
-            "\n"
-            "============================================================"
-        )
-
-        print(
-            "STAGE 1 COMPLETE"
-        )
-
-        print(
-            "============================================================"
-        )
+        print("\n============================================================")
+        print("STAGE 1 COMPLETE")
+        print("============================================================")
 
         print(
             f"ShapeNet best model:\n"
@@ -805,14 +896,11 @@ if __name__ == "__main__":
         )
 
     else:
-
         shapenet_encoder = None
         shapenet_decoder = None
 
-        print(
-            "\n⏭️ ShapeNet pretraining disabled."
-        )
-
+        print("\n⏭️ ShapeNet pretraining disabled.")
+        
     # ============================================================
     # STAGE 2: SCANNET
     # ============================================================
@@ -886,55 +974,6 @@ if __name__ == "__main__":
     )
 
     # ============================================================
-    # SHAPENET → SCANNET TRANSFER
-    # ============================================================
-
-    if USE_SHAPENET_PRETRAIN:
-
-        print(
-            "\n"
-            "============================================================"
-        )
-
-        print(
-            "TRANSFERRING SHAPENET → SCANNET"
-        )
-
-        print(
-            "============================================================"
-        )
-
-        transfer_compatible_weights(
-            shapenet_decoder,
-            decoder,
-            "Decoder",
-        )
-
-        transfer_compatible_weights(
-            shapenet_encoder,
-            encoder,
-            "Encoder",
-        )
-
-        print(
-            "\n✅ ShapeNet weights transferred "
-            "where architectures/shapes matched."
-        )
-
-        print(
-            "⚠️ ScanNet-specific input layers "
-            "remain randomly initialized when "
-            "their shapes do not match."
-        )
-
-    else:
-
-        print(
-            "\n🆕 ScanNet model initialized "
-            "from scratch."
-        )
-
-    # ============================================================
     # SCANNET OPTIMIZER
     # ============================================================
 
@@ -949,7 +988,7 @@ if __name__ == "__main__":
     criterion = nn.BCEWithLogitsLoss()
 
     # ============================================================
-    # SCANNET CHECKPOINT RESUME
+    # SCANNET CHECKPOINT RESUME / SHAPENET INITIALIZATION
     # ============================================================
 
     os.makedirs(
@@ -970,17 +1009,10 @@ if __name__ == "__main__":
         "latest_model.pth",
     )
 
-    # Only resume ScanNet if ShapeNet transfer is
-    # not being used for a brand-new run.
-    if (
-        not USE_SHAPENET_PRETRAIN
-        and os.path.exists(
-            scanet_resume_ckpt
-        )
-    ):
+    if os.path.exists(scanet_resume_ckpt):
 
         print(
-            f"\n📂 Resuming ScanNet checkpoint:"
+            f"\n📂 Existing ScanNet checkpoint found:"
             f"\n{scanet_resume_ckpt}"
         )
 
@@ -991,31 +1023,73 @@ if __name__ == "__main__":
         )
 
         encoder.load_state_dict(
-            checkpoint[
-                "encoder_state_dict"
-            ]
+            checkpoint["encoder_state_dict"]
         )
 
         decoder.load_state_dict(
-            checkpoint[
-                "decoder_state_dict"
-            ]
+            checkpoint["decoder_state_dict"]
         )
 
         optimizer.load_state_dict(
-            checkpoint[
-                "optimizer_state_dict"
-            ]
+            checkpoint["optimizer_state_dict"]
         )
 
-        start_epoch = checkpoint[
-            "epoch"
-        ]
+        start_epoch = checkpoint["epoch"]
 
         print(
-            f"✅ Resuming ScanNet from "
-            f"epoch {start_epoch}"
+            f"✅ Resuming ScanNet from epoch "
+            f"{start_epoch}"
         )
+
+    else:
+
+        if USE_SHAPENET_PRETRAIN:
+
+            print(
+                "\n"
+                "============================================================"
+            )
+
+            print(
+                "TRANSFERRING SHAPENET → SCANNET"
+            )
+
+            print(
+                "============================================================"
+            )
+
+            transfer_shapenet_encoder(
+                shapenet_encoder,
+                encoder,
+                ENCODER_ABLATION,
+            )
+
+            transfer_compatible_weights(
+                shapenet_decoder,
+                decoder,
+                "Decoder",
+            )
+
+            print(
+                "\n✅ ShapeNet weights transferred "
+                "where architectures/shapes matched."
+            )
+
+            print(
+                "⚠️ ScanNet-specific input layers "
+                "remain randomly initialized when "
+                "their shapes do not match."
+            )
+
+        else:
+
+            print(
+                "\n🆕 No ScanNet checkpoint found."
+            )
+
+            print(
+                "Initializing ScanNet model from scratch."
+            )
 
     # ============================================================
     # SCANNET MODEL SUMMARY
@@ -1070,10 +1144,16 @@ if __name__ == "__main__":
             "Input feature dimension: 1408\n"
         )
 
-        f.write(
-            "Encoder output: 1024-D "
-            "(mean + max pooling)\n"
-        )
+        if ARCHITECTURE == "ours":
+            f.write(
+                "Encoder output: 1024-D "
+                "(mean + max pooling)\n"
+            )
+        else:
+            f.write(
+                "Encoder output: 1024-D "
+                "(attention pooling + projection)\n"
+            )
 
         if ARCHITECTURE == "ours":
 
