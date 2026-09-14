@@ -45,12 +45,12 @@ if __name__ == "__main__":
     # ARCHITECTURE = "dinocomplete"
 
     # ENCODER_ABLATION = "coord_dino"
-    # ENCODER_ABLATION = "utonia_dino"
-    ENCODER_ABLATION = "utonia"
+    ENCODER_ABLATION = "utonia_dino"
+    # ENCODER_ABLATION = "utonia"
 
-    DECODER_ABLATION = "baseline"
+    # DECODER_ABLATION = "baseline"
     # DECODER_ABLATION = "fourier"
-    # DECODER_ABLATION = "fourier_residual"
+    DECODER_ABLATION = "fourier_residual"
 
     MODE = "scannet_train"
     DATA_DIR = "data/pairs_scannet/train/*.pt"
@@ -151,7 +151,7 @@ if __name__ == "__main__":
     # DATASET
     # ============================================================
 
-    data_files = glob.glob(DATA_DIR)
+    data_files = sorted(glob.glob(DATA_DIR))
 
     if not data_files:
         raise FileNotFoundError(

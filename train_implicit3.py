@@ -707,8 +707,8 @@ if __name__ == "__main__":
     # ARCHITECTURE = "dinocomplete"
 
     # ENCODER_ABLATION = "coord_dino"
-    ENCODER_ABLATION = "utonia_dino"
-    # ENCODER_ABLATION = "utonia"
+    # ENCODER_ABLATION = "utonia_dino"
+    ENCODER_ABLATION = "utonia"
 
     # DECODER_ABLATION = "baseline"
     # DECODER_ABLATION = "fourier"
@@ -977,13 +977,116 @@ if __name__ == "__main__":
     # SCANNET OPTIMIZER
     # ============================================================
 
-    optimizer = torch.optim.AdamW(
-        list(encoder.parameters())
-        +
-        list(decoder.parameters()),
-        lr=SCANNET_LR,
-        weight_decay=SCANNET_WD,
-    )
+    if ENCODER_ABLATION == "utonia_dino":
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "params": encoder.utonia_input_norm.parameters(),
+                    "lr": 1e-5,
+                },
+                {
+                    "params": encoder.utonia_encoder.parameters(),
+                    "lr": 1e-5,
+                },
+                {
+                    "params": encoder.utonia_context.parameters(),
+                    "lr": 1e-5,
+                },
+                {
+                    "params": encoder.dino_input_norm.parameters(),
+                    "lr": 1e-4,
+                },
+                {
+                    "params": encoder.semantic_encoder.parameters(),
+                    "lr": 1e-4,
+                },
+                {
+                    "params": encoder.sem_context.parameters(),
+                    "lr": 1e-4,
+                },
+                {
+                    "params": encoder.fusion.parameters(),
+                    "lr": 1e-4,
+                },
+                {
+                    "params": encoder.global_projection.parameters(),
+                    "lr": 1e-4,
+                },
+                {
+                    "params": decoder.parameters(),
+                    "lr": 1e-5,
+                },
+            ],
+            weight_decay=SCANNET_WD,
+        )
+    elif ENCODER_ABLATION == "coord_dino":
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "params": encoder.geometry_encoder.parameters(),
+                    "lr": 1e-5,
+                },
+                {
+                    "params": encoder.geo_context.parameters(),
+                    "lr": 1e-5,
+                },
+                {
+                    "params": encoder.dino_input_norm.parameters(),
+                    "lr": 1e-4,
+                },
+                {
+                    "params": encoder.semantic_encoder.parameters(),
+                    "lr": 1e-4,
+                },
+                {
+                    "params": encoder.sem_context.parameters(),
+                    "lr": 1e-4,
+                },
+                {
+                    "params": encoder.fusion.parameters(),
+                    "lr": 1e-4,
+                },
+                {
+                    "params": encoder.global_projection.parameters(),
+                    "lr": 1e-4,
+                },
+                {
+                    "params": decoder.parameters(),
+                    "lr": 1e-5,
+                },
+            ],
+            weight_decay=SCANNET_WD,
+        )
+    elif ENCODER_ABLATION == "utonia":
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "params": encoder.utonia_input_norm.parameters(),
+                    "lr": 1e-5,
+                },
+                {
+                    "params": encoder.utonia_encoder.parameters(),
+                    "lr": 1e-5,
+                },
+                {
+                    "params": encoder.context.parameters(),
+                    "lr": 1e-5,
+                },
+                {
+                    "params": encoder.fusion.parameters(),
+                    "lr": 1e-5,
+                },
+                {
+                    "params": encoder.global_projection.parameters(),
+                    "lr": 1e-5,
+                },
+                {
+                    "params": decoder.parameters(),
+                    "lr": 1e-5,
+                },
+            ],
+            weight_decay=SCANNET_WD,
+        )
 
     criterion = nn.BCEWithLogitsLoss()
 
