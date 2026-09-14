@@ -10,7 +10,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
 
-#SBATCH --time=04:00:00
+#SBATCH --time=06:00:00
 
 source $(conda info --base)/etc/profile.d/conda.sh
 
@@ -24,7 +24,7 @@ echo "================================="
 
 cd /mnt/aiongpfs/users/zkittel/PointCompleteRobot/
 
-python train_implicit2.py
+python train_implicit3.py
 
 echo "================================="
 echo "Finished: $(date)"

@@ -34,14 +34,13 @@ if __name__ == "__main__":
         "cuda" if torch.cuda.is_available() else "cpu"
     )
 
-    ENCODER_ABLATION = "coord_dino"
+    # ENCODER_ABLATION = "coord_dino"
     # ENCODER_ABLATION = "utonia_dino"
-    # ENCODER_ABLATION = "utonia"
+    ENCODER_ABLATION = "utonia"
 
-    DECODER_ABLATION = "hidden384_fourier"
     # DECODER_ABLATION = "baseline"
-    # DECODER_ABLATION = "hidden384"
-    # DECODER_ABLATION = "hidden384_fourier_residual"
+    # DECODER_ABLATION = "fourier"
+    DECODER_ABLATION = "fourier_residual"
 
     if ENCODER_ABLATION not in ENCODER_ABLATIONS:
         raise ValueError(
@@ -56,17 +55,16 @@ if __name__ == "__main__":
     encoder_config = ENCODER_ABLATIONS[ENCODER_ABLATION]
     decoder_config = DECODER_ABLATIONS[DECODER_ABLATION]
                                        
-    DATA_DIR = "data/pairs_scannet/train/*.pt"
-    data_files = glob.glob(DATA_DIR)
+    import json
 
-    train_size = int(0.8 * len(data_files))
-    val_size = int(0.1 * len(data_files))
-    test_size = len(data_files) - train_size - val_size
+    with open(
+        "data/pairs_scannet/test_split.json",
+        "r"
+    ) as f:
+        test_files = json.load(f)
 
-    train_files, val_files, test_files = random_split(
-        data_files,
-        [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(42),
+    print(
+        f"Loaded fixed test set: {len(test_files)} samples"
     )
 
     test_dataset = ScanNetppImplicitDataset(
@@ -85,7 +83,7 @@ if __name__ == "__main__":
     ).to(device)
     
     checkpoint_path = (
-        "runs/scannet_train_ours_coord_dino_hidden384_fourier/"
+        "runs/scannet_finetune_ours_utonia_fourier_residual/"
         "checkpoints/best_model.pth"
     )
 
@@ -110,5 +108,5 @@ if __name__ == "__main__":
         decoder=decoder,
         test_dataset=test_dataset,
         device=device,
-        RUN_DIR="runs/scannet_train_ours_coord_dino_hidden384_fourier/",
+        RUN_DIR="runs/scannet_finetune_ours_utonia_fourier_residual/",
     )
