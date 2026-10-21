@@ -82,8 +82,6 @@ The resulting features are aggregated into a **1024-dimensional global latent re
 
 The visual features are extracted using **DINOv2 ViT-S/14**, while Utonia provides learned 3D features.
 
-<img width="844" height="925" alt="image" src="https://github.com/user-attachments/assets/cdc631a2-5db5-45fa-bb7d-3097706422f2" />
-
 
 ### 3. Implicit decoder
 
@@ -120,6 +118,8 @@ This gives **nine proposed configurations**.
 An additional experiment evaluates the **DinoComplete** model as an external baseline.
 
 A separate experiment investigates whether **ShapeNet pretraining** can improve performance when transferring the model to realistic ScanNet++ observations.
+
+<img width="844" height="925" alt="image" src="https://github.com/user-attachments/assets/cdc631a2-5db5-45fa-bb7d-3097706422f2" />
 
 ---
 
